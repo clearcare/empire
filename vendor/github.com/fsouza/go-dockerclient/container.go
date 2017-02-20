@@ -1037,3 +1037,26 @@ type ContainerNotRunning struct {
 func (err *ContainerNotRunning) Error() string {
 	return "Container not running: " + err.ID
 }
+
+// DownloadFromContainerOptions is the set of options that can be used when
+// downloading resources from a container.
+//
+// See https://goo.gl/KnZJDX for more details.
+type DownloadFromContainerOptions struct {
+	OutputStream      io.Writer     `json:"-" qs:"-"`
+	Path              string        `qs:"path"`
+	InactivityTimeout time.Duration `qs:"-"`
+}
+
+// DownloadFromContainer downloads a tar archive of files or folders in a container.
+//
+// See https://goo.gl/KnZJDX for more details.
+func (c *Client) DownloadFromContainer(id string, opts DownloadFromContainerOptions) error {
+	url := fmt.Sprintf("/containers/%s/archive?", id) + queryString(opts)
+
+	return c.stream("GET", url, streamOptions{
+		setRawTerminal:    true,
+		stdout:            opts.OutputStream,
+		inactivityTimeout: opts.InactivityTimeout,
+	})
+}
