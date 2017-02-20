@@ -10,6 +10,7 @@ import (
 
 	"golang.org/x/net/context"
 
+  "github.com/remind101/empire/pkg/dockerutil"
 	"github.com/remind101/empire/pkg/image"
 	"github.com/remind101/empire/procfile"
 
@@ -37,14 +38,14 @@ func (fn ProcfileExtractorFunc) Extract(ctx context.Context, image image.Image, 
 // is a "web" process.
 type CMDExtractor struct {
 	// Client is the docker client to use to pull the container image.
-	client *docker.Client
+	client *dockerutil.Client
 }
 
-func NewCMDExtractor(c *docker.Client) *CMDExtractor {
+func NewCMDExtractor(c *dockerutil.Client) *CMDExtractor {
 	return &CMDExtractor{client: c}
 }
 
-func (e *CMDExtractor) Extract(_ context.Context, img image.Image, _ io.Writer) ([]byte, error) {
+func (e *CMDExtractor) Extract(ctx context.Context, img image.Image, _ io.Writer) ([]byte, error) {
 	i, err := e.client.InspectImage(img.String())
 	if err != nil {
 		return nil, err
@@ -88,28 +89,28 @@ func MultiExtractor(extractors ...ProcfileExtractor) ProcfileExtractor {
 // the Procfile from the images WORKDIR.
 type FileExtractor struct {
 	// Client is the docker client to use to pull the container image.
-	client *docker.Client
+	client *dockerutil.Client
 }
 
-func NewFileExtractor(c *docker.Client) *FileExtractor {
+func NewFileExtractor(c *dockerutil.Client) *FileExtractor {
 	return &FileExtractor{client: c}
 }
 
 // Extract implements Extractor Extract.
-func (e *FileExtractor) Extract(_ context.Context, img image.Image, w io.Writer) ([]byte, error) {
-	c, err := e.createContainer(img)
+func (e *FileExtractor) Extract(ctx context.Context, img image.Image, w io.Writer) ([]byte, error) {
+	c, err := e.createContainer(ctx, img)
 	if err != nil {
 		return nil, err
 	}
 
-	defer e.removeContainer(c.ID)
+	defer e.removeContainer(ctx, c.ID)
 
-	pfile, err := e.procfile(c.ID)
+	pfile, err := e.procfile(ctx, c.ID)
 	if err != nil {
 		return nil, err
 	}
 
-	b, err := e.copyFile(c.ID, pfile)
+	b, err := e.copyFile(ctx, c.ID, pfile)
 	if err != nil {
 		return nil, &ProcfileError{Err: err}
 	}
@@ -119,7 +120,7 @@ func (e *FileExtractor) Extract(_ context.Context, img image.Image, w io.Writer)
 
 // procfile returns the path to the Procfile. If the container has a WORKDIR
 // set, then this will return a path to the Procfile within that directory.
-func (e *FileExtractor) procfile(id string) (string, error) {
+func (e *FileExtractor) procfile(ctx context.Context, id string) (string, error) {
 	p := ""
 
 	c, err := e.client.InspectContainer(id)
@@ -135,8 +136,8 @@ func (e *FileExtractor) procfile(id string) (string, error) {
 }
 
 // createContainer creates a new docker container for the given docker image.
-func (e *FileExtractor) createContainer(img image.Image) (*docker.Container, error) {
-	return e.client.CreateContainer(docker.CreateContainerOptions{
+func (e *FileExtractor) createContainer(ctx context.Context, img image.Image) (*docker.Container, error) {
+	return e.client.CreateContainer(ctx, docker.CreateContainerOptions{
 		Config: &docker.Config{
 			Image: img.String(),
 		},
@@ -144,16 +145,16 @@ func (e *FileExtractor) createContainer(img image.Image) (*docker.Container, err
 }
 
 // removeContainer removes a container by its ID.
-func (e *FileExtractor) removeContainer(containerID string) error {
-	return e.client.RemoveContainer(docker.RemoveContainerOptions{
+func (e *FileExtractor) removeContainer(ctx context.Context, containerID string) error {
+	return e.client.RemoveContainer(ctx, ocker.RemoveContainerOptions{
 		ID: containerID,
 	})
 }
 
 // copyFile copies a file from a container.
-func (e *FileExtractor) copyFile(containerID, path string) ([]byte, error) {
+func (e *FileExtractor) copyFile(ctx context.Context, containerID, path string) ([]byte, error) {
 	var buf bytes.Buffer
-	if err := e.client.CopyFromContainer(docker.CopyFromContainerOptions{
+	if err := e.client.CopyFromContainer(ctx, docker.CopyFromContainerOptions{
 		Container:    containerID,
 		Resource:     path,
 		OutputStream: &buf,

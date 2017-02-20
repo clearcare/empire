@@ -711,8 +711,8 @@ func newJSONMessageError(err error) jsonmessage.JSONMessage {
 // CMD directive in the Dockerfile.
 func PullAndExtract(c *dockerutil.Client) ProcfileExtractor {
 	e := MultiExtractor(
-		NewFileExtractor(c.Client),
-		NewCMDExtractor(c.Client),
+		NewFileExtractor(c),
+		NewCMDExtractor(c),
 	)
 
 	return ProcfileExtractorFunc(func(ctx context.Context, img image.Image, w io.Writer) ([]byte, error) {
