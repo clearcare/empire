@@ -4,16 +4,19 @@ import (
 	"testing"
 
 	_ "github.com/lib/pq"
-	"github.com/remind101/migrate"
+	"github.com/remind101/empire/dbtest"
+	"github.com/remind101/empire/internal/migrate"
 	"github.com/stretchr/testify/assert"
 )
 
 // Tests migrating the database down, then back up again.
 func TestMigrations(t *testing.T) {
-	db, err := OpenDB("postgres://localhost/empire?sslmode=disable")
+	db, err := NewDB(dbtest.Open(t))
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	migrations := DefaultSchema.migrations()
 
 	err = db.migrator.Exec(migrate.Up, migrations...)
 	assert.NoError(t, err)
@@ -29,13 +32,13 @@ func TestMigrations(t *testing.T) {
 }
 
 func TestLatestSchema(t *testing.T) {
-	assert.Equal(t, 18, latestSchema())
+	assert.Equal(t, 20, DefaultSchema.latestSchema())
 }
 
 func TestNoDuplicateMigrations(t *testing.T) {
 	visited := make(map[int]bool)
 	expectedID := 1
-	for _, m := range migrations {
+	for _, m := range DefaultSchema.migrations() {
 		if visited[m.ID] {
 			t.Fatalf("Migration %d appears more than once", m.ID)
 		}

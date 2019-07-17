@@ -66,7 +66,7 @@
     "AmiId" : {
       "Type": "AWS::EC2::Image::Id",
       "Description": "The AMI id of the AMI to run the instances with. This defaults to the official ECS ami.",
-      "Default": "ami-55870742"
+      "Default": "ami-275ffe31"
     },
     "KeyName": {
       "Type": "String",
@@ -397,11 +397,55 @@
       }
     },
 
+    "DockerPolicy": {
+      "Type": "AWS::IAM::Policy",
+      "Properties": {
+        "PolicyName": "docker-cloudwatch-logs",
+        "Roles": [ { "Ref": "InstanceRole" } ],
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": [
+                "logs:CreateLogStream",
+                "logs:PutLogEvents"
+              ],
+              "Resource": [
+                { "Fn::Join": ["", ["arn:aws:logs:*:*:log-group:", { "Ref": "ApplicationLogGroup" }, ":log-stream:*"]] },
+                { "Fn::Join": ["", ["arn:aws:logs:*:*:log-group:", { "Ref": "DaemonLogGroup" }, ":log-stream:*"]] },
+                { "Fn::Join": ["", ["arn:aws:logs:*:*:log-group:", { "Ref": "PostgresLogGroup" }, ":log-stream:*"]] }
+              ]
+            }
+          ]
+        }
+      }
+    },
+
+    "EmpireRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "Path": "/",
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": [ "ecs-tasks.amazonaws.com" ]
+              },
+              "Action": [ "sts:AssumeRole" ]
+            }
+          ]
+        }
+      }
+    },
+
     "EmpirePolicy": {
       "Type": "AWS::IAM::Policy",
       "Properties": {
         "PolicyName": "empire",
-        "Roles": [ { "Ref": "InstanceRole" } ],
+        "Roles": [ { "Ref": "EmpireRole" } ],
         "Groups": [ { "Ref": "Group" } ],
         "PolicyDocument": {
           "Version": "2012-10-17",
@@ -411,7 +455,7 @@
               "Action": [
                 "iam:PassRole"
               ],
-              "Resource": { "Fn::GetAtt": ["ServiceRole", "Arn"] }
+              "Resource": "*"
             },
             {
               "Effect": "Allow",
@@ -507,16 +551,7 @@
             {
               "Effect": "Allow",
               "Action": [
-                "elasticloadbalancing:DeleteLoadBalancer",
-                "elasticloadbalancing:CreateLoadBalancer",
-                "elasticloadbalancing:DescribeLoadBalancers",
-                "elasticloadbalancing:DescribeTags",
-                "elasticloadbalancing:ConfigureHealthCheck",
-                "elasticloadbalancing:ModifyLoadBalancerAttributes",
-                "elasticloadbalancing:SetLoadBalancerListenerSSLCertificate",
-                "elasticloadbalancing:CreateLoadBalancerListeners",
-                "elasticloadbalancing:DeleteLoadBalancerListeners",
-                "elasticloadbalancing:SetLoadBalancerPoliciesOfListener"
+                "elasticloadbalancing:*"
               ],
               "Resource": ["*"]
             },
@@ -552,21 +587,16 @@
             {
               "Effect": "Allow",
               "Action": [
-                "route53:GetChange*"
+                "ec2:DescribeInstances"
               ],
-              "Resource": "arn:aws:route53:::change/*"
+              "Resource": "*"
             },
             {
               "Effect": "Allow",
               "Action": [
-                "logs:CreateLogStream",
-                "logs:PutLogEvents"
+                "route53:GetChange*"
               ],
-              "Resource": [
-                { "Fn::Join": ["", ["arn:aws:logs:*:*:log-group:", { "Ref": "ApplicationLogGroup" }, ":log-stream:*"]] },
-                { "Fn::Join": ["", ["arn:aws:logs:*:*:log-group:", { "Ref": "DaemonLogGroup" }, ":log-stream:*"]] },
-                { "Fn::Join": ["", ["arn:aws:logs:*:*:log-group:", { "Ref": "PostgresLogGroup" }, ":log-stream:*"]] }
-              ]
+              "Resource": "arn:aws:route53:::change/*"
             }
           ]
         }
@@ -732,6 +762,7 @@
 
     "DBSecurityGroup": {
       "Type": "AWS::EC2::SecurityGroup",
+      "Condition": "DemoMode",
       "Properties": {
         "GroupDescription": "Security group for RDS DB Instance.",
         "VpcId": { "Ref" : "Vpc" },
@@ -746,6 +777,7 @@
 
     "DBSubnetGroup": {
       "Type" : "AWS::RDS::DBSubnetGroup",
+      "Condition": "DemoMode",
       "Properties" : {
         "DBSubnetGroupDescription": "Subnet group for Empire db",
         "SubnetIds" : [{ "Ref": "PubSubnetAz1" }, { "Ref": "PubSubnetAz2" }]
@@ -754,6 +786,7 @@
 
     "DB": {
       "Type": "AWS::RDS::DBInstance",
+      "Condition": "DemoMode",
       "Properties": {
         "DBName": "empire",
         "Engine": "postgres",
@@ -772,6 +805,7 @@
       "Type": "AWS::ECS::TaskDefinition",
       "Condition": "DemoMode",
       "Properties": {
+        "TaskRoleArn": { "Fn::GetAtt": ["EmpireRole", "Arn"] },
         "ContainerDefinitions": [
           {
             "Name": "empire",

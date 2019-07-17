@@ -5,6 +5,11 @@ type PortMappingProperties struct {
 	HostPort      interface{} `json:",omitempty"`
 }
 
+type PlacementConstraint struct {
+	Type       interface{} `json:",omitempty"`
+	Expression interface{} `json:",omitempty"`
+}
+
 type ContainerDefinitionProperties struct {
 	Command          interface{}              `json:",omitempty"`
 	Cpu              interface{}              `json:",omitempty"`
@@ -20,13 +25,17 @@ type ContainerDefinitionProperties struct {
 }
 
 type TaskDefinitionProperties struct {
+	PlacementConstraints []*PlacementConstraint           `json:",omitempty"`
 	ContainerDefinitions []*ContainerDefinitionProperties `json:",omitempty"`
 	Volumes              []interface{}
+	TaskRoleArn          interface{} `json:",omitempty"`
 }
 
 type CustomTaskDefinitionProperties struct {
+	PlacementConstraints []*PlacementConstraint           `json:",omitempty"`
 	ContainerDefinitions []*ContainerDefinitionProperties `json:",omitempty"`
 	Family               interface{}                      `json:",omitempty"`
 	ServiceToken         interface{}                      `json:",omitempty"`
 	Volumes              []interface{}
+	TaskRoleArn          interface{} `json:",omitempty"`
 }

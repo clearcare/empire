@@ -6,9 +6,12 @@ import (
 	"net/url"
 
 	"github.com/jinzhu/gorm"
+	"github.com/remind101/empire/internal/migrate"
 	"github.com/remind101/empire/pkg/headerutil"
-	"github.com/remind101/migrate"
 )
+
+// Empire only supports postgres at the moment.
+const DBDriver = "postgres"
 
 // IncompatibleSchemaError is an error that gets returned from
 // CheckSchemaVersion.
@@ -24,6 +27,10 @@ func (e *IncompatibleSchemaError) Error() string {
 
 // DB wraps a gorm.DB and provides the datastore layer for Empire.
 type DB struct {
+	// Schema is the Schema instance that will be used to migrate the
+	// database to the latest schema. The zero value is DefaultSchema.
+	Schema *Schema
+
 	*gorm.DB
 
 	uri string
@@ -33,17 +40,22 @@ type DB struct {
 
 // OpenDB returns a new gorm.DB instance.
 func OpenDB(uri string) (*DB, error) {
-	u, err := url.Parse(uri)
+	_, err := url.Parse(uri)
 	if err != nil {
 		return nil, err
 	}
 
-	conn, err := sql.Open(u.Scheme, uri)
+	conn, err := sql.Open(DBDriver, uri)
 	if err != nil {
 		return nil, err
 	}
 
-	db, err := gorm.Open(u.Scheme, conn)
+	return NewDB(conn)
+}
+
+// NewDB wraps a sql.DB instance as a DB.
+func NewDB(conn *sql.DB) (*DB, error) {
+	db, err := gorm.Open(DBDriver, conn)
 	if err != nil {
 		return nil, err
 	}
@@ -58,14 +70,17 @@ func OpenDB(uri string) (*DB, error) {
 
 	return &DB{
 		DB:       &db,
-		uri:      uri,
 		migrator: m,
 	}, nil
 }
 
 // MigrateUp migrates the database to the latest version of the schema.
 func (db *DB) MigrateUp() error {
-	return db.migrator.Exec(migrate.Up, migrations...)
+	return db.migrator.Exec(migrate.Up, db.migrations()...)
+}
+
+func (db *DB) migrations() []migrate.Migration {
+	return db.schema().migrations()
 }
 
 // Reset resets the database to a pristine state.
@@ -80,7 +95,7 @@ func (db *DB) Reset() error {
 	exec(`TRUNCATE TABLE apps CASCADE`)
 	exec(`TRUNCATE TABLE ports CASCADE`)
 	exec(`TRUNCATE TABLE slugs CASCADE`)
-	exec(`INSERT INTO ports (port) (SELECT generate_series(9000,10000))`)
+	exec(`UPDATE ports SET app_id = NULL`)
 
 	return err
 }
@@ -106,7 +121,7 @@ func (db *DB) CheckSchemaVersion() error {
 		return fmt.Errorf("error fetching schema version: %v", err)
 	}
 
-	expectedSchemaVersion := latestSchema()
+	expectedSchemaVersion := db.schema().latestSchema()
 	if schemaVersion != expectedSchemaVersion {
 		return &IncompatibleSchemaError{
 			SchemaVersion:         schemaVersion,
@@ -128,6 +143,13 @@ func (db *DB) SchemaVersion() (int, error) {
 // Debug puts the db in debug mode, which logs all queries.
 func (db *DB) Debug() {
 	db.DB = db.DB.Debug()
+}
+
+func (db *DB) schema() *Schema {
+	if db.Schema == nil {
+		return DefaultSchema
+	}
+	return db.Schema
 }
 
 // scope is an interface that scopes a gorm.DB. Scopes are used in

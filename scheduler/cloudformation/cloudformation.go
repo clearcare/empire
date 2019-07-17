@@ -19,13 +19,15 @@ import (
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/client"
 	"github.com/aws/aws-sdk-go/service/cloudformation"
+	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/aws/aws-sdk-go/service/ecs"
 	"github.com/aws/aws-sdk-go/service/s3"
+	docker "github.com/fsouza/go-dockerclient"
 	"github.com/remind101/empire/pkg/arn"
 	"github.com/remind101/empire/pkg/bytesize"
 	pglock "github.com/remind101/empire/pkg/pg/lock"
-	"github.com/remind101/empire/scheduler"
 	"github.com/remind101/empire/stats"
+	"github.com/remind101/empire/twelvefactor"
 	"github.com/remind101/pkg/logger"
 	"golang.org/x/net/context"
 )
@@ -56,7 +58,7 @@ var (
 
 	// Controls the maximum amount of time we'll wait for a stack operation to
 	// complete before releasing the lock.
-	stackOperationTimeout = 10 * time.Minute
+	stackOperationTimeout = 1 * time.Hour
 
 	// Controls how long we'll wait between requests to describe services when
 	// waiting for a deployment to stabilize
@@ -72,8 +74,9 @@ const (
 
 // ECS limits
 const (
-	MaxDescribeTasks    = 100
-	MaxDescribeServices = 10
+	MaxDescribeTasks              = 100
+	MaxDescribeServices           = 10
+	MaxDescribeContainerInstances = 100
 )
 
 // DefaultStackNameTemplate is the default text/template for generating a
@@ -108,11 +111,31 @@ type ecsClient interface {
 	StopTask(*ecs.StopTaskInput) (*ecs.StopTaskOutput, error)
 	UpdateService(*ecs.UpdateServiceInput) (*ecs.UpdateServiceOutput, error)
 	DescribeServices(*ecs.DescribeServicesInput) (*ecs.DescribeServicesOutput, error)
+	DescribeContainerInstances(*ecs.DescribeContainerInstancesInput) (*ecs.DescribeContainerInstancesOutput, error)
+	WaitUntilTasksNotPending(*ecs.DescribeTasksInput) error
 }
 
 // s3Client duck types the s3.S3 interface that we use.
 type s3Client interface {
 	PutObject(*s3.PutObjectInput) (*s3.PutObjectOutput, error)
+}
+
+// ec2Client duck types the ec2.EC2 interface that we use.
+type ec2Client interface {
+	DescribeInstances(*ec2.DescribeInstancesInput) (*ec2.DescribeInstancesOutput, error)
+}
+
+// DockerClient defines the interface we use when using Docker to connect to a
+// running ECS task.
+type DockerClient interface {
+	ListContainers(docker.ListContainersOptions) ([]docker.APIContainers, error)
+	AttachToContainer(docker.AttachToContainerOptions) error
+}
+
+// Data handed to template generators.
+type TemplateData struct {
+	*twelvefactor.Manifest
+	StackTags []*cloudformation.Tag
 }
 
 // Template represents something that can generate a stack body. Conveniently
@@ -142,6 +165,10 @@ type Scheduler struct {
 	// Any additional tags to add to stacks.
 	Tags []*cloudformation.Tag
 
+	// NewDockerClient is used to open a new Docker connection to an ec2
+	// instance.
+	NewDockerClient func(*ec2.Instance) (DockerClient, error)
+
 	// CloudFormation client for creating stacks.
 	cloudformation cloudformationClient
 
@@ -150,6 +177,9 @@ type Scheduler struct {
 
 	// S3 client to upload templates to s3.
 	s3 s3Client
+
+	// EC2 client to interact with EC2.
+	ec2 ec2Client
 
 	db *sql.DB
 
@@ -160,15 +190,16 @@ type Scheduler struct {
 func NewScheduler(db *sql.DB, config client.ConfigProvider) *Scheduler {
 	return &Scheduler{
 		cloudformation: cloudformation.New(config),
-		ecs:            ecsWithCaching(ecs.New(config)),
+		ecs:            ecsWithCaching(&ECS{ecs.New(config)}),
 		s3:             s3.New(config),
+		ec2:            ec2.New(config),
 		db:             db,
 		after:          time.After,
 	}
 }
 
 // Submit creates (or updates) the CloudFormation stack for the app.
-func (s *Scheduler) Submit(ctx context.Context, app *scheduler.App, ss scheduler.StatusStream) error {
+func (s *Scheduler) Submit(ctx context.Context, app *twelvefactor.Manifest, ss twelvefactor.StatusStream) error {
 	return s.SubmitWithOptions(ctx, app, ss, SubmitOptions{})
 }
 
@@ -180,7 +211,7 @@ type SubmitOptions struct {
 }
 
 // SubmitWithOptions submits (or updates) the CloudFormation stack for the app.
-func (s *Scheduler) SubmitWithOptions(ctx context.Context, app *scheduler.App, ss scheduler.StatusStream, opts SubmitOptions) error {
+func (s *Scheduler) SubmitWithOptions(ctx context.Context, app *twelvefactor.Manifest, ss twelvefactor.StatusStream, opts SubmitOptions) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -194,13 +225,13 @@ func (s *Scheduler) SubmitWithOptions(ctx context.Context, app *scheduler.App, s
 	return tx.Commit()
 }
 
-func (s *Scheduler) Restart(ctx context.Context, app *scheduler.App, ss scheduler.StatusStream) error {
-	stackName, err := s.stackName(app.ID)
+func (s *Scheduler) Restart(ctx context.Context, appID string, ss twelvefactor.StatusStream) error {
+	stackName, err := s.stackName(appID)
 	if err != nil {
 		return err
 	}
 	output := make(chan stackOperationOutput, 1)
-	return s.updateStack(ctx, &updateStackInput{
+	if err := s.updateStack(ctx, &updateStackInput{
 		StackName: aws.String(stackName),
 		Parameters: []*cloudformation.Parameter{
 			{
@@ -208,12 +239,24 @@ func (s *Scheduler) Restart(ctx context.Context, app *scheduler.App, ss schedule
 				ParameterValue: aws.String(newTimestamp()),
 			},
 		},
-	}, output, ss)
+	}, output, ss); err != nil {
+		return err
+	}
+
+	if ss != nil {
+		o := <-output
+		if o.err != nil || o.stack == nil {
+			return o.err
+		}
+		// TODO: Wait for services to stabilize?
+	}
+
+	return nil
 }
 
 // Submit creates (or updates) the CloudFormation stack for the app.
-func (s *Scheduler) submit(ctx context.Context, tx *sql.Tx, app *scheduler.App, ss scheduler.StatusStream, opts SubmitOptions) error {
-	stackName, err := s.stackName(app.ID)
+func (s *Scheduler) submit(ctx context.Context, tx *sql.Tx, app *twelvefactor.Manifest, ss twelvefactor.StatusStream, opts SubmitOptions) error {
+	stackName, err := s.stackName(app.AppID)
 	if err == errNoStack {
 		t := s.StackNameTemplate
 		if t == nil {
@@ -224,14 +267,16 @@ func (s *Scheduler) submit(ctx context.Context, tx *sql.Tx, app *scheduler.App, 
 			return fmt.Errorf("error generating stack name: %v", err)
 		}
 		stackName = buf.String()
-		if _, err := tx.Exec(`INSERT INTO stacks (app_id, stack_name) VALUES ($1, $2)`, app.ID, stackName); err != nil {
+		if _, err := tx.Exec(`INSERT INTO stacks (app_id, stack_name) VALUES ($1, $2)`, app.AppID, stackName); err != nil {
 			return err
 		}
 	} else if err != nil {
 		return err
 	}
 
-	t, err := s.createTemplate(ctx, app)
+	stackTags := append(s.Tags, tagsFromLabels(app.Labels)...)
+
+	t, err := s.createTemplate(ctx, app, stackTags)
 	if err != nil {
 		return err
 	}
@@ -240,25 +285,20 @@ func (s *Scheduler) submit(ctx context.Context, tx *sql.Tx, app *scheduler.App, 
 		fmt.Sprintf("stack:%s", stackName),
 	})
 
-	scheduler.Publish(ctx, ss, fmt.Sprintf("Created cloudformation template: %v (%d/%d bytes)", *t.URL, t.Size, MaxTemplateSize))
-
-	tags := append(s.Tags,
-		&cloudformation.Tag{Key: aws.String("empire.app.id"), Value: aws.String(app.ID)},
-		&cloudformation.Tag{Key: aws.String("empire.app.name"), Value: aws.String(app.Name)},
-	)
+	publish(ctx, ss, fmt.Sprintf("Created cloudformation template: %v (%d/%d bytes)", *t.URL, t.Size, MaxTemplateSize))
 
 	var parameters []*cloudformation.Parameter
 	if opts.NoDNS != nil {
 		parameters = append(parameters, &cloudformation.Parameter{
 			ParameterKey:   aws.String("DNS"),
-			ParameterValue: aws.String(fmt.Sprintf("%t", *opts.NoDNS)),
+			ParameterValue: aws.String(fmt.Sprintf("%t", !*opts.NoDNS)),
 		})
 	}
 
 	for _, p := range app.Processes {
 		parameters = append(parameters, &cloudformation.Parameter{
 			ParameterKey:   aws.String(scaleParameter(p.Type)),
-			ParameterValue: aws.String(fmt.Sprintf("%d", p.Instances)),
+			ParameterValue: aws.String(fmt.Sprintf("%d", p.Quantity)),
 		})
 	}
 
@@ -270,7 +310,7 @@ func (s *Scheduler) submit(ctx context.Context, tx *sql.Tx, app *scheduler.App, 
 		if err := s.createStack(ctx, &createStackInput{
 			StackName:  aws.String(stackName),
 			Template:   t,
-			Tags:       tags,
+			Tags:       stackTags,
 			Parameters: parameters,
 		}, output, ss); err != nil {
 			return fmt.Errorf("error creating stack: %v", err)
@@ -280,8 +320,7 @@ func (s *Scheduler) submit(ctx context.Context, tx *sql.Tx, app *scheduler.App, 
 			StackName:  aws.String(stackName),
 			Template:   t,
 			Parameters: parameters,
-			// TODO: Update Go client
-			// Tags:         tags,
+			Tags:       stackTags,
 		}, output, ss); err != nil {
 			return err
 		}
@@ -301,14 +340,14 @@ func (s *Scheduler) submit(ctx context.Context, tx *sql.Tx, app *scheduler.App, 
 	return nil
 }
 
-func (s *Scheduler) waitUntilStable(ctx context.Context, stack *cloudformation.Stack, ss scheduler.StatusStream) error {
+func (s *Scheduler) waitUntilStable(ctx context.Context, stack *cloudformation.Stack, ss twelvefactor.StatusStream) error {
 	deployments, err := deploymentsToWatch(stack)
 	if err != nil {
 		return err
 	}
 	deploymentStatuses := s.waitForDeploymentsToStabilize(ctx, deployments)
 	for status := range deploymentStatuses {
-		scheduler.Publish(ctx, ss, fmt.Sprintf("Service %s became %s", status.deployment.process, status))
+		publish(ctx, ss, fmt.Sprintf("Service %s became %s", status.deployment.process, status))
 	}
 	// TODO publish notification to empire
 	return nil
@@ -384,13 +423,18 @@ func (s *Scheduler) waitForDeploymentsToStabilize(ctx context.Context, deploymen
 
 // createTemplate takes a scheduler.App, and returns a validated cloudformation
 // template.
-func (s *Scheduler) createTemplate(ctx context.Context, app *scheduler.App) (*cloudformationTemplate, error) {
+func (s *Scheduler) createTemplate(ctx context.Context, app *twelvefactor.Manifest, stackTags []*cloudformation.Tag) (*cloudformationTemplate, error) {
+	data := &TemplateData{
+		Manifest:  app,
+		StackTags: stackTags,
+	}
+
 	buf := new(bytes.Buffer)
-	if err := s.Template.Execute(buf, app); err != nil {
+	if err := s.Template.Execute(buf, data); err != nil {
 		return nil, err
 	}
 
-	key := fmt.Sprintf("%s/%s/%x", app.Name, app.ID, sha1.Sum(buf.Bytes()))
+	key := fmt.Sprintf("%s/%s/%x", app.Name, app.AppID, sha1.Sum(buf.Bytes()))
 	url := fmt.Sprintf("https://%s.s3.amazonaws.com/%s", s.Bucket, key)
 
 	if _, err := s.s3.PutObject(&s3.PutObjectInput{
@@ -437,7 +481,7 @@ type createStackInput struct {
 // createStack creates a new CloudFormation stack with the given input. This
 // function returns as soon as the stack creation has been submitted. It does
 // not wait for the stack creation to complete.
-func (s *Scheduler) createStack(ctx context.Context, input *createStackInput, output chan stackOperationOutput, ss scheduler.StatusStream) error {
+func (s *Scheduler) createStack(ctx context.Context, input *createStackInput, output chan stackOperationOutput, ss twelvefactor.StatusStream) error {
 	waiter := s.waitFor(ctx, createStack, ss)
 
 	submitted := make(chan error)
@@ -464,13 +508,14 @@ type updateStackInput struct {
 	StackName  *string
 	Parameters []*cloudformation.Parameter
 	Template   *cloudformationTemplate
+	Tags       []*cloudformation.Tag
 }
 
 // updateStack updates an existing CloudFormation stack with the given input.
 // If there are no other active updates, this function returns as soon as the
 // stack update has been submitted. If there are other updates, the function
 // returns after `lockTimeout` and the update continues in the background.
-func (s *Scheduler) updateStack(ctx context.Context, input *updateStackInput, output chan stackOperationOutput, ss scheduler.StatusStream) error {
+func (s *Scheduler) updateStack(ctx context.Context, input *updateStackInput, output chan stackOperationOutput, ss twelvefactor.StatusStream) error {
 	waiter := s.waitFor(ctx, updateStack, ss)
 
 	locked := make(chan struct{})
@@ -479,7 +524,7 @@ func (s *Scheduler) updateStack(ctx context.Context, input *updateStackInput, ou
 		close(locked)
 		err := s.executeStackUpdate(input)
 		if err == nil {
-			scheduler.Publish(ctx, ss, "Stack update submitted")
+			publish(ctx, ss, "Stack update submitted")
 		}
 		submitted <- err
 		return err
@@ -493,7 +538,7 @@ func (s *Scheduler) updateStack(ctx context.Context, input *updateStackInput, ou
 	var err error
 	select {
 	case <-s.after(lockWait):
-		scheduler.Publish(ctx, ss, "Waiting for existing stack operation to complete")
+		publish(ctx, ss, "Waiting for existing stack operation to complete")
 		// FIXME: At this point, we don't want to affect UX by waiting
 		// around, so we return. But, if the stack update times out, or
 		// there's an error, that information is essentially silenced.
@@ -521,7 +566,7 @@ type stackOperationOutput struct {
 //   until the other stack operation has completed.
 // * If there is another pending stack operation, it will be replaced by the new
 //   update.
-func (s *Scheduler) performStackOperation(ctx context.Context, stackName string, fn func() error, waiter waitFunc, ss scheduler.StatusStream) (*cloudformation.Stack, error) {
+func (s *Scheduler) performStackOperation(ctx context.Context, stackName string, fn func() error, waiter waitFunc, ss twelvefactor.StatusStream) (*cloudformation.Stack, error) {
 	l, err := newAdvisoryLock(s.db, stackName)
 	if err != nil {
 		return nil, err
@@ -539,7 +584,7 @@ func (s *Scheduler) performStackOperation(ctx context.Context, stackName string,
 		//
 		// TODO: Should we return an error here?
 		if err == pglock.Canceled {
-			scheduler.Publish(ctx, ss, "Operation superseded by newer release")
+			publish(ctx, ss, "Operation superseded by newer release")
 			return nil, nil
 		}
 		return nil, fmt.Errorf("error obtaining stack operation lock %s: %v", stackName, err)
@@ -591,6 +636,7 @@ func (s *Scheduler) executeStackUpdate(input *updateStackInput) error {
 	i := &cloudformation.UpdateStackInput{
 		StackName:  input.StackName,
 		Parameters: updateParameters(input.Parameters, stack, input.Template),
+		Tags:       input.Tags,
 	}
 	if input.Template != nil {
 		i.TemplateURL = input.Template.URL
@@ -672,9 +718,9 @@ func (s *Scheduler) remove(_ context.Context, tx *sql.Tx, appID string) error {
 	return nil
 }
 
-// Instances returns all of the running tasks for this application.
-func (s *Scheduler) Instances(ctx context.Context, app string) ([]*scheduler.Instance, error) {
-	var instances []*scheduler.Instance
+// Tasks returns all of the running tasks for this application.
+func (s *Scheduler) Tasks(ctx context.Context, app string) ([]*twelvefactor.Task, error) {
+	var instances []*twelvefactor.Task
 
 	tasks, err := s.tasks(app)
 	if err != nil {
@@ -696,6 +742,36 @@ func (s *Scheduler) Instances(ctx context.Context, app string) ([]*scheduler.Ins
 		}
 	}
 
+	// Map from clusterARN to containerInstanceARN pointers to batch tasks from the same cluster
+	clusterMap := make(map[string][]*string)
+
+	for _, t := range tasks {
+		k := *t.ClusterArn
+		clusterMap[k] = append(clusterMap[k], t.ContainerInstanceArn)
+	}
+
+	// Map from containerInstanceARN to ec2-instance-id
+	hostMap := make(map[string]string)
+
+	for clusterArn, containerArnPtrs := range clusterMap {
+		for _, chunk := range chunkStrings(containerArnPtrs, MaxDescribeContainerInstances) {
+			resp, err := s.ecs.DescribeContainerInstances(&ecs.DescribeContainerInstancesInput{
+				Cluster:            aws.String(clusterArn),
+				ContainerInstances: chunk,
+			})
+			if err != nil {
+				return nil, err
+			}
+			for _, f := range resp.Failures {
+				return nil, fmt.Errorf("error describing container instance %s: %s", aws.StringValue(f.Arn), aws.StringValue(f.Reason))
+			}
+
+			for _, ci := range resp.ContainerInstances {
+				hostMap[aws.StringValue(ci.ContainerInstanceArn)] = aws.StringValue(ci.Ec2InstanceId)
+			}
+		}
+	}
+
 	for _, t := range tasks {
 		taskDefinition := taskDefinitions[*t.TaskDefinitionArn]
 
@@ -704,12 +780,14 @@ func (s *Scheduler) Instances(ctx context.Context, app string) ([]*scheduler.Ins
 			return instances, err
 		}
 
+		hostId := hostMap[*t.ContainerInstanceArn]
+
 		p, err := taskDefinitionToProcess(taskDefinition)
 		if err != nil {
 			return instances, err
 		}
 
-		state := safeString(t.LastStatus)
+		state := aws.StringValue(t.LastStatus)
 		var updatedAt time.Time
 		switch state {
 		case "PENDING":
@@ -720,10 +798,11 @@ func (s *Scheduler) Instances(ctx context.Context, app string) ([]*scheduler.Ins
 			updatedAt = *t.StoppedAt
 		}
 
-		instances = append(instances, &scheduler.Instance{
+		instances = append(instances, &twelvefactor.Task{
 			Process:   p,
 			State:     state,
 			ID:        id,
+			Host:      twelvefactor.Host{ID: hostId},
 			UpdatedAt: updatedAt,
 		})
 	}
@@ -843,36 +922,158 @@ func (s *Scheduler) Stop(ctx context.Context, taskID string) error {
 }
 
 // Run registers a TaskDefinition for the process, and calls RunTask.
-func (m *Scheduler) Run(ctx context.Context, app *scheduler.App, process *scheduler.Process, in io.Reader, out io.Writer) error {
-	if out != nil {
-		return errors.New("running an attached process is not implemented by the ECS manager.")
+func (m *Scheduler) Run(ctx context.Context, app *twelvefactor.Manifest) error {
+	for _, process := range app.Processes {
+		var attached bool
+		if process.Stdout != nil || process.Stderr != nil {
+			attached = true
+		}
+
+		t, ok := m.Template.(interface {
+			ContainerDefinition(*twelvefactor.Manifest, *twelvefactor.Process) *ecs.ContainerDefinition
+		})
+		if !ok {
+			return errors.New("provided template can't generate a container definition for this process")
+		}
+
+		containerDefinition := t.ContainerDefinition(app, process)
+		if attached {
+			if containerDefinition.DockerLabels == nil {
+				containerDefinition.DockerLabels = make(map[string]*string)
+			}
+			// NOTE: Currently, this depends on a patched version of the
+			// Amazon ECS Container Agent, since the official agent doesn't
+			// provide a method to pass these down to the `CreateContainer`
+			// call.
+			containerDefinition.DockerLabels["docker.config.Tty"] = aws.String("true")
+			containerDefinition.DockerLabels["docker.config.OpenStdin"] = aws.String("true")
+		}
+
+		resp, err := m.ecs.RegisterTaskDefinition(&ecs.RegisterTaskDefinitionInput{
+			Family:      aws.String(fmt.Sprintf("%s--%s", app.AppID, process.Type)),
+			TaskRoleArn: taskRoleArn(app),
+			ContainerDefinitions: []*ecs.ContainerDefinition{
+				containerDefinition,
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("error registering TaskDefinition: %v", err)
+		}
+
+		input := &ecs.RunTaskInput{
+			TaskDefinition: resp.TaskDefinition.TaskDefinitionArn,
+			Cluster:        aws.String(m.Cluster),
+			Count:          aws.Int64(1),
+			StartedBy:      aws.String(app.AppID),
+		}
+
+		if v := process.ECS; v != nil {
+			input.PlacementConstraints = v.PlacementConstraints
+			input.PlacementStrategy = v.PlacementStrategy
+		}
+
+		runResp, err := m.ecs.RunTask(input)
+		if err != nil {
+			return fmt.Errorf("error calling RunTask: %v", err)
+		}
+
+		for _, f := range runResp.Failures {
+			return fmt.Errorf("error running task %s: %s", aws.StringValue(f.Arn), aws.StringValue(f.Reason))
+		}
+
+		task := runResp.Tasks[0]
+
+		if attached {
+			// Ensure that we atleast try to stop the task, after we detach
+			// from the process. This ensures that we don't have zombie
+			// one-off processes lying around.
+			defer m.ecs.StopTask(&ecs.StopTaskInput{
+				Cluster: task.ClusterArn,
+				Task:    task.TaskArn,
+			})
+
+			if err := m.attach(ctx, task, process.Stdin, process.Stdout, process.Stderr); err != nil {
+				return err
+			}
+		}
 	}
 
-	t, ok := m.Template.(interface {
-		ContainerDefinition(*scheduler.App, *scheduler.Process) *ecs.ContainerDefinition
+	return nil
+}
+
+// attach attaches to the given ECS task.
+func (m *Scheduler) attach(ctx context.Context, task *ecs.Task, stdin io.Reader, stdout, stderr io.Writer) error {
+	if a, _ := arn.Parse(aws.StringValue(task.TaskArn)); a != nil {
+		fmt.Fprintf(stderr, "Attaching to %s...\r\n", a.Resource)
+	}
+
+	descContainerInstanceResp, err := m.ecs.DescribeContainerInstances(&ecs.DescribeContainerInstancesInput{
+		Cluster:            task.ClusterArn,
+		ContainerInstances: []*string{task.ContainerInstanceArn},
 	})
-	if !ok {
-		return errors.New("provided template can't generate a container definition for this process")
+	if err != nil {
+		return fmt.Errorf("error describing container instance (%s): %v", aws.StringValue(task.ContainerInstanceArn), err)
 	}
 
-	resp, err := m.ecs.RegisterTaskDefinition(&ecs.RegisterTaskDefinitionInput{
-		Family: aws.String(fmt.Sprintf("%s--%s", app.ID, process.Type)),
-		ContainerDefinitions: []*ecs.ContainerDefinition{
-			t.ContainerDefinition(app, process),
+	containerInstance := descContainerInstanceResp.ContainerInstances[0]
+	descInstanceResp, err := m.ec2.DescribeInstances(&ec2.DescribeInstancesInput{
+		InstanceIds: []*string{containerInstance.Ec2InstanceId},
+	})
+	if err != nil {
+		return fmt.Errorf("error describing ec2 instance (%s): %v", aws.StringValue(containerInstance.Ec2InstanceId), err)
+	}
+
+	ec2Instance := descInstanceResp.Reservations[0].Instances[0]
+
+	// Wait for the task to start running. It will stay in the
+	// PENDING state while the container is being pulled.
+	if err := m.ecs.WaitUntilTasksNotPending(&ecs.DescribeTasksInput{
+		Cluster: task.ClusterArn,
+		Tasks:   []*string{task.TaskArn},
+	}); err != nil {
+		return fmt.Errorf("error waiting for %s to transition from PENDING state: %s", aws.StringValue(task.TaskArn), err)
+	}
+
+	// Open a new connection to the Docker daemon on the EC2
+	// instance where the task is running.
+	d, err := m.NewDockerClient(ec2Instance)
+	if err != nil {
+		return fmt.Errorf("error connecting to docker daemon on %s: %v", aws.StringValue(ec2Instance.InstanceId), err)
+	}
+
+	// Find the container id for the ECS task.
+	containers, err := d.ListContainers(docker.ListContainersOptions{
+		All: true,
+		Filters: map[string][]string{
+			"label": []string{
+				fmt.Sprintf("com.amazonaws.ecs.task-arn=%s", aws.StringValue(task.TaskArn)),
+				//fmt.Sprintf("com.amazonaws.ecs.container-name", p)
+			},
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("error registering TaskDefinition: %v", err)
+		return fmt.Errorf("error listing containers for task: %v", err)
 	}
 
-	_, err = m.ecs.RunTask(&ecs.RunTaskInput{
-		TaskDefinition: resp.TaskDefinition.TaskDefinitionArn,
-		Cluster:        aws.String(m.Cluster),
-		Count:          aws.Int64(1),
-		StartedBy:      aws.String(app.ID),
-	})
-	if err != nil {
-		return fmt.Errorf("error calling RunTask: %v", err)
+	if len(containers) != 1 {
+		return fmt.Errorf("unable to find container for %s running on %s", aws.StringValue(task.TaskArn), aws.StringValue(ec2Instance.InstanceId))
+	}
+
+	containerID := containers[0].ID
+
+	if err := d.AttachToContainer(docker.AttachToContainerOptions{
+		Container:    containerID,
+		InputStream:  stdin,
+		OutputStream: stdout,
+		ErrorStream:  stderr,
+		Logs:         true,
+		Stream:       true,
+		Stdin:        true,
+		Stdout:       true,
+		Stderr:       true,
+		RawTerminal:  true,
+	}); err != nil {
+		return fmt.Errorf("error attaching to container (%s): %v", containerID, err)
 	}
 
 	return nil
@@ -924,7 +1125,7 @@ var waiters = map[stackOperation]waiter{
 // waitFor returns a wait function that will wait for the given stack operation
 // to complete, and sends status messages to the status stream, and also records
 // metrics for how long the operation took.
-func (s *Scheduler) waitFor(ctx context.Context, op stackOperation, ss scheduler.StatusStream) func(*cloudformation.DescribeStacksInput) error {
+func (s *Scheduler) waitFor(ctx context.Context, op stackOperation, ss twelvefactor.StatusStream) func(*cloudformation.DescribeStacksInput) error {
 	waiter := waiters[op]
 	wait := waiter.wait(s.cloudformation)
 
@@ -932,12 +1133,12 @@ func (s *Scheduler) waitFor(ctx context.Context, op stackOperation, ss scheduler
 		tags := []string{
 			fmt.Sprintf("stack:%s", *input.StackName),
 		}
-		scheduler.Publish(ctx, ss, waiter.startMessage)
+		publish(ctx, ss, waiter.startMessage)
 		start := time.Now()
 		err := wait(input)
 		stats.Timing(ctx, fmt.Sprintf("scheduler.cloudformation.%s", op), time.Since(start), 1.0, tags)
 		if err == nil {
-			scheduler.Publish(ctx, ss, waiter.successMessage)
+			publish(ctx, ss, waiter.successMessage)
 		}
 		return err
 	}
@@ -959,7 +1160,7 @@ func extractProcessData(value string) map[string]string {
 
 // taskDefinitionToProcess takes an ECS Task Definition and converts it to a
 // Process.
-func taskDefinitionToProcess(td *ecs.TaskDefinition) (*scheduler.Process, error) {
+func taskDefinitionToProcess(td *ecs.TaskDefinition) (*twelvefactor.Process, error) {
 	// If this task definition has no container definitions, then something
 	// funky is up.
 	if len(td.ContainerDefinitions) == 0 {
@@ -976,26 +1177,18 @@ func taskDefinitionToProcess(td *ecs.TaskDefinition) (*scheduler.Process, error)
 	env := make(map[string]string)
 	for _, kvp := range container.Environment {
 		if kvp != nil {
-			env[safeString(kvp.Name)] = safeString(kvp.Value)
+			env[aws.StringValue(kvp.Name)] = aws.StringValue(kvp.Value)
 		}
 	}
 
-	return &scheduler.Process{
-		Type:        safeString(container.Name),
-		Command:     command,
-		Env:         env,
-		CPUShares:   uint(*container.Cpu),
-		MemoryLimit: uint(*container.Memory) * bytesize.MB,
-		Nproc:       uint(softLimit(container.Ulimits, "nproc")),
+	return &twelvefactor.Process{
+		Type:      aws.StringValue(container.Name),
+		Command:   command,
+		Env:       env,
+		CPUShares: uint(*container.Cpu),
+		Memory:    uint(*container.Memory) * bytesize.MB,
+		Nproc:     uint(softLimit(container.Ulimits, "nproc")),
 	}, nil
-}
-
-func safeString(s *string) string {
-	if s == nil {
-		return ""
-	}
-
-	return *s
 }
 
 func softLimit(ulimits []*ecs.Ulimit, name string) int64 {
@@ -1161,4 +1354,12 @@ func deploymentsToWatch(stack *cloudformation.Stack) (map[string]*ecsDeployment,
 		}
 	}
 	return ecsDeployments, nil
+}
+
+func publish(ctx context.Context, stream twelvefactor.StatusStream, msg string) {
+	if stream != nil {
+		if err := stream.Publish(twelvefactor.Status{Message: msg}); err != nil {
+			logger.Warn(ctx, fmt.Sprintf("error publishing to stream: %v", err))
+		}
+	}
 }

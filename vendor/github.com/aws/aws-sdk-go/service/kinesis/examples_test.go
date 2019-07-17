@@ -16,7 +16,9 @@ var _ time.Duration
 var _ bytes.Buffer
 
 func ExampleKinesis_AddTagsToStream() {
-	svc := kinesis.New(session.New())
+	sess := session.Must(session.NewSession())
+
+	svc := kinesis.New(sess)
 
 	params := &kinesis.AddTagsToStreamInput{
 		StreamName: aws.String("StreamName"), // Required
@@ -39,7 +41,9 @@ func ExampleKinesis_AddTagsToStream() {
 }
 
 func ExampleKinesis_CreateStream() {
-	svc := kinesis.New(session.New())
+	sess := session.Must(session.NewSession())
+
+	svc := kinesis.New(sess)
 
 	params := &kinesis.CreateStreamInput{
 		ShardCount: aws.Int64(1),             // Required
@@ -59,7 +63,9 @@ func ExampleKinesis_CreateStream() {
 }
 
 func ExampleKinesis_DecreaseStreamRetentionPeriod() {
-	svc := kinesis.New(session.New())
+	sess := session.Must(session.NewSession())
+
+	svc := kinesis.New(sess)
 
 	params := &kinesis.DecreaseStreamRetentionPeriodInput{
 		RetentionPeriodHours: aws.Int64(1),             // Required
@@ -79,7 +85,9 @@ func ExampleKinesis_DecreaseStreamRetentionPeriod() {
 }
 
 func ExampleKinesis_DeleteStream() {
-	svc := kinesis.New(session.New())
+	sess := session.Must(session.NewSession())
+
+	svc := kinesis.New(sess)
 
 	params := &kinesis.DeleteStreamInput{
 		StreamName: aws.String("StreamName"), // Required
@@ -97,8 +105,29 @@ func ExampleKinesis_DeleteStream() {
 	fmt.Println(resp)
 }
 
+func ExampleKinesis_DescribeLimits() {
+	sess := session.Must(session.NewSession())
+
+	svc := kinesis.New(sess)
+
+	var params *kinesis.DescribeLimitsInput
+	resp, err := svc.DescribeLimits(params)
+
+	if err != nil {
+		// Print the error, cast err to awserr.Error to get the Code and
+		// Message from an error.
+		fmt.Println(err.Error())
+		return
+	}
+
+	// Pretty-print the response data.
+	fmt.Println(resp)
+}
+
 func ExampleKinesis_DescribeStream() {
-	svc := kinesis.New(session.New())
+	sess := session.Must(session.NewSession())
+
+	svc := kinesis.New(sess)
 
 	params := &kinesis.DescribeStreamInput{
 		StreamName:            aws.String("StreamName"), // Required
@@ -119,7 +148,9 @@ func ExampleKinesis_DescribeStream() {
 }
 
 func ExampleKinesis_DisableEnhancedMonitoring() {
-	svc := kinesis.New(session.New())
+	sess := session.Must(session.NewSession())
+
+	svc := kinesis.New(sess)
 
 	params := &kinesis.DisableEnhancedMonitoringInput{
 		ShardLevelMetrics: []*string{ // Required
@@ -142,7 +173,9 @@ func ExampleKinesis_DisableEnhancedMonitoring() {
 }
 
 func ExampleKinesis_EnableEnhancedMonitoring() {
-	svc := kinesis.New(session.New())
+	sess := session.Must(session.NewSession())
+
+	svc := kinesis.New(sess)
 
 	params := &kinesis.EnableEnhancedMonitoringInput{
 		ShardLevelMetrics: []*string{ // Required
@@ -165,7 +198,9 @@ func ExampleKinesis_EnableEnhancedMonitoring() {
 }
 
 func ExampleKinesis_GetRecords() {
-	svc := kinesis.New(session.New())
+	sess := session.Must(session.NewSession())
+
+	svc := kinesis.New(sess)
 
 	params := &kinesis.GetRecordsInput{
 		ShardIterator: aws.String("ShardIterator"), // Required
@@ -185,7 +220,9 @@ func ExampleKinesis_GetRecords() {
 }
 
 func ExampleKinesis_GetShardIterator() {
-	svc := kinesis.New(session.New())
+	sess := session.Must(session.NewSession())
+
+	svc := kinesis.New(sess)
 
 	params := &kinesis.GetShardIteratorInput{
 		ShardId:                aws.String("ShardId"),           // Required
@@ -208,7 +245,9 @@ func ExampleKinesis_GetShardIterator() {
 }
 
 func ExampleKinesis_IncreaseStreamRetentionPeriod() {
-	svc := kinesis.New(session.New())
+	sess := session.Must(session.NewSession())
+
+	svc := kinesis.New(sess)
 
 	params := &kinesis.IncreaseStreamRetentionPeriodInput{
 		RetentionPeriodHours: aws.Int64(1),             // Required
@@ -228,7 +267,9 @@ func ExampleKinesis_IncreaseStreamRetentionPeriod() {
 }
 
 func ExampleKinesis_ListStreams() {
-	svc := kinesis.New(session.New())
+	sess := session.Must(session.NewSession())
+
+	svc := kinesis.New(sess)
 
 	params := &kinesis.ListStreamsInput{
 		ExclusiveStartStreamName: aws.String("StreamName"),
@@ -248,7 +289,9 @@ func ExampleKinesis_ListStreams() {
 }
 
 func ExampleKinesis_ListTagsForStream() {
-	svc := kinesis.New(session.New())
+	sess := session.Must(session.NewSession())
+
+	svc := kinesis.New(sess)
 
 	params := &kinesis.ListTagsForStreamInput{
 		StreamName:           aws.String("StreamName"), // Required
@@ -269,7 +312,9 @@ func ExampleKinesis_ListTagsForStream() {
 }
 
 func ExampleKinesis_MergeShards() {
-	svc := kinesis.New(session.New())
+	sess := session.Must(session.NewSession())
+
+	svc := kinesis.New(sess)
 
 	params := &kinesis.MergeShardsInput{
 		AdjacentShardToMerge: aws.String("ShardId"),    // Required
@@ -290,7 +335,9 @@ func ExampleKinesis_MergeShards() {
 }
 
 func ExampleKinesis_PutRecord() {
-	svc := kinesis.New(session.New())
+	sess := session.Must(session.NewSession())
+
+	svc := kinesis.New(sess)
 
 	params := &kinesis.PutRecordInput{
 		Data:                      []byte("PAYLOAD"),          // Required
@@ -313,7 +360,9 @@ func ExampleKinesis_PutRecord() {
 }
 
 func ExampleKinesis_PutRecords() {
-	svc := kinesis.New(session.New())
+	sess := session.Must(session.NewSession())
+
+	svc := kinesis.New(sess)
 
 	params := &kinesis.PutRecordsInput{
 		Records: []*kinesis.PutRecordsRequestEntry{ // Required
@@ -340,7 +389,9 @@ func ExampleKinesis_PutRecords() {
 }
 
 func ExampleKinesis_RemoveTagsFromStream() {
-	svc := kinesis.New(session.New())
+	sess := session.Must(session.NewSession())
+
+	svc := kinesis.New(sess)
 
 	params := &kinesis.RemoveTagsFromStreamInput{
 		StreamName: aws.String("StreamName"), // Required
@@ -363,7 +414,9 @@ func ExampleKinesis_RemoveTagsFromStream() {
 }
 
 func ExampleKinesis_SplitShard() {
-	svc := kinesis.New(session.New())
+	sess := session.Must(session.NewSession())
+
+	svc := kinesis.New(sess)
 
 	params := &kinesis.SplitShardInput{
 		NewStartingHashKey: aws.String("HashKey"),    // Required
@@ -371,6 +424,29 @@ func ExampleKinesis_SplitShard() {
 		StreamName:         aws.String("StreamName"), // Required
 	}
 	resp, err := svc.SplitShard(params)
+
+	if err != nil {
+		// Print the error, cast err to awserr.Error to get the Code and
+		// Message from an error.
+		fmt.Println(err.Error())
+		return
+	}
+
+	// Pretty-print the response data.
+	fmt.Println(resp)
+}
+
+func ExampleKinesis_UpdateShardCount() {
+	sess := session.Must(session.NewSession())
+
+	svc := kinesis.New(sess)
+
+	params := &kinesis.UpdateShardCountInput{
+		ScalingType:      aws.String("ScalingType"), // Required
+		StreamName:       aws.String("StreamName"),  // Required
+		TargetShardCount: aws.Int64(1),              // Required
+	}
+	resp, err := svc.UpdateShardCount(params)
 
 	if err != nil {
 		// Print the error, cast err to awserr.Error to get the Code and

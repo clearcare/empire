@@ -1,14 +1,78 @@
 # Changelog
 
-## HEAD
+## 0.13.0
+
+**Features**
+
+* [cmd/empire] Empire now supports a new (experimental) feature to enable attached processes to be ran with ECS. [#1043](https://github.com/remind101/empire/pull/1043)
+* [cmd/emp,cmd/empire] Empire now supports "maintenance mode" for applications. [#1086](https://github.com/remind101/empire/pull/1086)
+* [cmd/empire] Added a new configuration option for controlling the generated CloudFormation stack names. [#1094](https://github.com/remind101/empire/pull/1094)
+* [cmd/empire] Empire now supports ECS placement constraints and strategies in the extended Procfile format. [#1059](https://github.com/remind101/empire/pull/1059)
+
+**Bugs**
+
+* [cmd/emp] Fixed a regression in env-load, which caused it to set keys to random values. [#1062](https://github.com/remind101/empire/pull/1062)
+* [cmd/empire] Fixed an issue where the ECS task role was not set on tasks started from `emp run`. [#1063](https://github.com/remind101/empire/pull/1063)
+* [cmd/empire] Fixed a bug that prevented Docker images using a digest as a reference from being deployed. [#1104](https://github.com/remind101/empire/pull/1104)
+
+**Improvements**
+
+* [cmd/empire] Processes can now be scaled down to a negative value to prevent AWS resources from being created. [#1064](https://github.com/remind101/empire/pull/1064)
+* [cmd/empire] AWS resources for scheduled processes are now always created, unless scaled down to a negative value. [#1064](https://github.com/remind101/empire/pull/1064)
+* [cmd/empire] Empire now supports reporting its own errors to [Rollbar](https://rollbar.com) in addition to Honeybadger. [#1075](https://github.com/remind101/empire/pull/1075)
+* [cmd/empire]It's now possible to configure the pool of ports that the `Custom::InstancePort` resource allocates ports from. [#1096](https://github.com/remind101/empire/pull/1096)
+* [cmd/emp] STDOUT and STDERR in `emp run`'s now show up on STDOUT and STDERR in the terminal, instead of being merged on STDOUT. [#1101](https://github.com/remind101/empire/pull/1101)
+
+**Security**
+
+* [cmd/empire] Empire can now automatically resolve a Docker tag to it's immutable content addressable identifier. [#1104](https://github.com/remind101/empire/pull/1104)
+
+## 0.12.0 (2017-03-10)
+
+**Features**
+
+* The extended Procfile format now allows you to attach a load balancer to any process in the Procfile. [#800](https://github.com/remind101/empire/pull/800)
+* An ALIAS record is now created for `<process>.<app>.<zone>` [#1005](https://github.com/remind101/empire/pull/1005)
+* You can now provide a `-p` flag to the `emp cert-attach` command to attach a certificate to a specific process (instead of just `web`). [#1014](https://github.com/remind101/empire/pull/1014)
+* Empire now supports a SAML authentication backend. [#1017](https://github.com/remind101/empire/pull/1017)
+
+**Improvements**
+
+* `emp ps` now displays the task's host. [#983](https://github.com/remind101/empire/pull/983)
+* The `empire` and `emp` binaries are now built with Go 1.7 [#971](https://github.com/remind101/empire/pull/971)
+* `emp env-load` now handles multi-line environment variables. [#990](https://github.com/remind101/empire/pull/990)
+* In preparation for the 0.12 release, the legacy ECS scheduler has been removed. [#1001](https://github.com/remind101/empire/pull/1001)
+* All application labels are set on the CloudFormation stack, rather than just `empire.app.id` and `empire.app.name`. In addition, ALB's will get stack tags applied to them. [#1004](https://github.com/remind101/empire/pull/1004)
+* The lock timeout for CloudFormation stack operations has been increased [#1030](https://github.com/remind101/empire/pull/1030)
+
+**Bugs**
+
+* `emp deploy` will now prompt for a commit message if one is required but not provided. [#994](https://github.com/remind101/empire/issues/994)
+* Fixed a bug where the GitHub authentication backend would sometimes return unauthenticated errors randomly. [#1029](https://github.com/remind101/empire/pull/1029)
+
+**Security**
+
+* It's now possible to set a maximum session duration, to ensure that users have to periodically re-authenticate with credentials and MFA [#1024](https://github.com/remind101/empire/pull/1024)
+
+## 0.11.1 (2017-03-10)
+
+**Bugs**
+
+* Fixed a regression from 0.10.1 where migrating apps from the legacy backend to CloudFormation would fail [#1046](https://github.com/remind101/empire/pull/1046)
+
+## 0.11.0 (2016-08-22)
 
 **Features**
 
 * Empire now includes experimental support for showing attached runs in `emp ps`. This can be enabled with the `--x.showattached` flag, or `EMPIRE_X_SHOW_ATTACHED` [#911](https://github.com/remind101/empire/pull/911)
 * Empire now includes experimental support for scheduled tasks [#919](https://github.com/remind101/empire/pull/919)
 * Empire now supports streaming status updates from the scheduler while deploying [#888](https://github.com/remind101/empire/issues/888)
+* You can now provision Empire applications and set environment variables from CloudFormation stacks using the `Custom::EmpireApp` and `Custom::EmpireAppEnvironment` resources [#819](https://github.com/remind101/empire/pull/819)
 * Empire now supports sending internal metrics to statsd or dogstatsd [#953](https://github.com/remind101/empire/pull/953)
 * Attached and detached runs now have an `empire.user` label attached to them [#965](https://github.com/remind101/empire/pull/965)
+* You can now provide the name of a process defined in the Procfile when calling `emp run` [#967](https://github.com/remind101/empire/pull/967)
+* Empire now includes experimental support for the new [Application Load Balancers](https://aws.amazon.com/blogs/aws/new-aws-application-load-balancer/) by setting the `LOAD_BALANCER_TYPE=alb` environment variable. [#969](https://github.com/remind101/empire/pull/969)
+* Empire now also sets an `EMPIRE_PROCESS_SCALE` environment variable, which includes the desired number of processes [#964](https://github.com/remind101/empire/issues/964)
 
 **Improvements**
 
@@ -18,7 +82,8 @@
 * The log level within empire can now be configured when starting the service. [#929](https://github.com/remind101/empire/issues/929)
 * The CloudFormation backend now has experimental support for a `Custom::ECSTaskDefinition` resource that greatly reduces the size of generated templates. [#935](https://github.com/remind101/empire/pull/935)
 * The Scheduler now has a `Restart` method which will trigger a restart of all the processes within an app. Previously, a "Restart" just re-released the app. Now schedulers like the cloudformation backend can optimize how the restart is handled. [#697](https://github.com/remind101/empire/issues/697)
-* `emp run` now publishes an event when it is ran [#954](https://github.com/remind101/empire/pull/954)
+* `emp run` now publishes an event when it is ran. [#954](https://github.com/remind101/empire/pull/954)
+* `emp rollback` requires confirmation if rolling back more than 9 versions. [#975](https://github.com/remind101/empire/pull/975)
 
 **Bugs**
 
@@ -36,6 +101,8 @@
 * ECS Task Definitions are now cached in memory for improved `emp ps` performance. [#902](https://github.com/remind101/empire/pull/902)
 
 **Security**
+
+* Empire now has a new `commands.allowed` flag that controls the behavior of what commands are allowed with `emp run`. This can be set to `procfile` to limit `emp run` to only allow commands defined in the Procfile.
 
 ## 0.10.1 (2016-06-14)
 

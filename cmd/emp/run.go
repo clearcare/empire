@@ -14,6 +14,7 @@ import (
 
 	"github.com/docker/docker/pkg/term"
 	"github.com/remind101/empire/pkg/heroku"
+	"github.com/remind101/empire/pkg/stdcopy"
 )
 
 var (
@@ -32,6 +33,10 @@ var cmdRun = &Command{
 Run a process on Heroku. Flags such as` + " `-a` " + `may be parsed out of
 the command unless the command is quoted or provided after a
 double-dash (--).
+
+When running an attached process that reads from stdin (like bash) you may experience a "hang".
+Usually, pressing a key like "enter" will flush the output to your terminal.
+See https://github.com/remind101/empire/issues/609
 
 Options:
 
@@ -97,10 +102,6 @@ func runRun(cmd *Command, args []string) {
 		opts.Env = &env
 	}
 	if dynoSize != "" {
-		if !strings.HasSuffix(dynoSize, "X") {
-			cmd.PrintUsage()
-			os.Exit(2)
-		}
 		opts.Size = &dynoSize
 	}
 
@@ -126,7 +127,9 @@ func runRun(cmd *Command, args []string) {
 	}
 
 	rh := heroku.RequestHeaders{CommitMessage: message}
-	req, err := client.NewRequest("POST", "/apps/"+appname+"/dynos", params, rh.Headers())
+	header := rh.Headers()
+	header.Set("X-Multiplex", "1")
+	req, err := client.NewRequest("POST", "/apps/"+appname+"/dynos", params, header)
 	must(err)
 
 	u, err := url.Parse(apiURL)
@@ -175,7 +178,11 @@ func runRun(cmd *Command, args []string) {
 		defer close(exit)
 		defer close(errChanOut)
 		var err error
-		_, err = io.Copy(os.Stdout, br)
+		if res.Header.Get("Content-Type") == "application/vnd.empire.stdcopy-stream" {
+			_, err = stdcopy.StdCopy(os.Stdout, os.Stderr, br)
+		} else {
+			_, err = io.Copy(os.Stdout, br)
+		}
 		errChanOut <- err
 	}()
 	go func() {

@@ -1,4 +1,10 @@
 build
 .env*
 *.swp
-release
+*.dump
+*.key
+*.cert
+
+# Emacs temporary files
+\#*\#
+.\#*

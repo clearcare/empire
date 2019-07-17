@@ -6,13 +6,12 @@ package server
 import (
 	"io"
 	"net/http"
+	"net/url"
 
 	"github.com/remind101/empire"
-	"github.com/remind101/empire/server/auth"
+	"github.com/remind101/empire/internal/saml"
 	"github.com/remind101/empire/server/github"
 	"github.com/remind101/empire/server/heroku"
-	"github.com/remind101/pkg/httpx"
-	"golang.org/x/net/context"
 )
 
 var (
@@ -20,8 +19,6 @@ var (
 )
 
 type Options struct {
-	Authenticator auth.Authenticator
-
 	GitHub struct {
 		// Deployments
 		Webhooks struct {
@@ -35,35 +32,74 @@ type Options struct {
 	}
 }
 
-func New(e *empire.Empire, options Options) httpx.Handler {
-	r := httpx.NewRouter()
+// Server composes the Heroku API compatibility layer, the GitHub Webhooks
+// handlers and a health check as a single http.Handler.
+type Server struct {
+	// Base host for the server.
+	URL *url.URL
+
+	// The underlying Heroku http.Handler.
+	Heroku *heroku.Server
+
+	GitHubWebhooks http.Handler
+
+	Health *HealthHandler
+
+	// If provided, enables the SAML integration.
+	ServiceProvider *saml.ServiceProvider
+}
+
+func New(e *empire.Empire, options Options) *Server {
+	s := &Server{}
 
 	if options.GitHub.Webhooks.Secret != "" {
 		// Mount GitHub webhooks
-		g := github.New(e, github.Options{
+		s.GitHubWebhooks = github.New(e, github.Options{
 			Secret:       options.GitHub.Webhooks.Secret,
 			Environments: options.GitHub.Deployments.Environments,
 			Deployer:     newDeployer(e, options),
 		})
-		r.Match(githubWebhook, g)
 	}
 
-	// Mount the heroku api
-	hk := heroku.New(e)
-	hk.Authenticator = options.Authenticator
-	r.Headers("Accept", heroku.AcceptHeader).Handler(hk)
+	s.Heroku = heroku.New(e)
+	s.Health = NewHealthHandler(e)
 
-	// Mount health endpoint
-	r.Handle("/health", NewHealthHandler(e))
-
-	return r
+	return s
 }
 
-// githubWebhook is a MatcherFunc that matches requests that have an
-// `X-GitHub-Event` header present.
-func githubWebhook(r *http.Request) bool {
-	h := r.Header[http.CanonicalHeaderKey("X-GitHub-Event")]
-	return len(h) > 0
+func (s *Server) Handler(r *http.Request) http.Handler {
+	h := s.handler(r)
+	if h == nil {
+		h = http.NotFoundHandler()
+	}
+	return h
+}
+
+func (s *Server) handler(r *http.Request) http.Handler {
+	if r.Header.Get("X-GitHub-Event") != "" {
+		return s.GitHubWebhooks
+	}
+
+	// Route to Heroku API.
+	if r.Header.Get("Accept") == heroku.AcceptHeader {
+		return s.Heroku
+	}
+
+	switch r.URL.Path {
+	case "/saml/login":
+		return http.HandlerFunc(s.SAMLLogin)
+	case "/saml/acs":
+		return http.HandlerFunc(s.SAMLACS)
+	case "/health":
+		return s.Health
+	}
+
+	return nil
+}
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h := s.Handler(r)
+	h.ServeHTTP(w, r)
 }
 
 // HealthHandler is an http.Handler that returns the health of empire.
@@ -80,17 +116,15 @@ func NewHealthHandler(e *empire.Empire) *HealthHandler {
 	}
 }
 
-func (h *HealthHandler) ServeHTTPContext(_ context.Context, w http.ResponseWriter, r *http.Request) error {
+func (h *HealthHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	err := h.IsHealthy()
 	if err == nil {
 		w.WriteHeader(http.StatusOK)
-		return nil
+		return
 	}
 
 	w.WriteHeader(http.StatusServiceUnavailable)
 	io.WriteString(w, err.Error())
-
-	return nil
 }
 
 // newDeployer generates a new github.Deployer implementation for the given
@@ -106,9 +140,6 @@ func newDeployer(e *empire.Empire, options Options) github.Deployer {
 	if url := options.GitHub.Deployments.TugboatURL; url != "" {
 		d = github.NotifyTugboat(d, url)
 	}
-
-	// Add tracing information so we know about errors.
-	d = github.TraceDeploy(d)
 
 	// Perform the deployment within a go routine so we don't timeout
 	// githubs webhook requests.

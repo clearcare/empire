@@ -6,11 +6,8 @@ import (
 	"io"
 	"time"
 
-	"github.com/fsouza/go-dockerclient"
 	"github.com/jinzhu/gorm"
-	"github.com/remind101/empire/pkg/dockerutil"
 	"github.com/remind101/empire/pkg/image"
-	"github.com/remind101/empire/scheduler"
 	"golang.org/x/net/context"
 )
 
@@ -32,35 +29,68 @@ var (
 	}
 )
 
+// AllowedCommands specifies what commands are allowed to be Run with Empire.
+type AllowedCommands int
+
+const (
+	// AllowCommandAny will allow any command to be run.
+	AllowCommandAny AllowedCommands = iota
+	// AllowCommandProcfile will only allow commands specified in the
+	// Procfile (the key itself) to be run. Any other command will return an
+	// error.
+	AllowCommandProcfile
+)
+
+// An error that is returned when a command is not whitelisted to be Run.
+type CommandNotAllowedError struct {
+	Command Command
+}
+
+// commandNotInFormation returns a new CommandNotAllowedError for a command
+// that's not in the formation.
+func commandNotInFormation(command Command, formation Formation) *CommandNotAllowedError {
+	return &CommandNotAllowedError{Command: command}
+}
+
+// Error implements the error interface.
+func (c *CommandNotAllowedError) Error() string {
+	return fmt.Sprintf("command not allowed: %v\n", c.Command)
+}
+
+// NoCertError is returned when the Procfile specifies an https/ssl listener but
+// there is no attached certificate.
+type NoCertError struct {
+	Process string
+}
+
+func (e *NoCertError) Error() string {
+	return fmt.Sprintf("the %s process does not have a certificate attached", e.Process)
+}
+
 // Empire provides the core public API for Empire. Refer to the package
 // documentation for details.
 type Empire struct {
 	DB *DB
 	db *gorm.DB
 
-	accessTokens *accessTokensService
-	apps         *appsService
-	configs      *configsService
-	domains      *domainsService
-	tasks        *tasksService
-	releases     *releasesService
-	deployer     *deployerService
-	runner       *runnerService
-	slugs        *slugsService
-	certs        *certsService
-
-	// Secret is used to sign JWT access tokens.
-	Secret []byte
+	apps     *appsService
+	configs  *configsService
+	domains  *domainsService
+	tasks    *tasksService
+	releases *releasesService
+	deployer *deployerService
+	runner   *runnerService
+	slugs    *slugsService
+	certs    *certsService
 
 	// Scheduler is the backend scheduler used to run applications.
-	Scheduler scheduler.Scheduler
+	Scheduler Scheduler
 
 	// LogsStreamer is the backend used to stream application logs.
 	LogsStreamer LogsStreamer
 
-	// ProcfileExtractor is called during deployments to extract the
-	// Formation from the Procfile in the newly deployed image.
-	ProcfileExtractor ProcfileExtractor
+	// ImageRegistry is used to interract with container images.
+	ImageRegistry ImageRegistry
 
 	// Environment represents the environment this Empire server is responsible for
 	Environment string
@@ -73,6 +103,10 @@ type Empire struct {
 
 	// MessagesRequired is a boolean used to determine if messages should be required for events.
 	MessagesRequired bool
+
+	// Configures what type of commands are allowed to be run with the Run
+	// method. The zero value allows all commands to be run.
+	AllowedCommands AllowedCommands
 }
 
 // New returns a new Empire instance.
@@ -85,7 +119,6 @@ func New(db *DB) *Empire {
 		db: db.DB,
 	}
 
-	e.accessTokens = &accessTokensService{Empire: e}
 	e.apps = &appsService{Empire: e}
 	e.configs = &configsService{Empire: e}
 	e.deployer = &deployerService{Empire: e}
@@ -96,16 +129,6 @@ func New(db *DB) *Empire {
 	e.releases = &releasesService{Empire: e}
 	e.certs = &certsService{Empire: e}
 	return e
-}
-
-// AccessTokensFind finds an access token.
-func (e *Empire) AccessTokensFind(token string) (*AccessToken, error) {
-	return e.accessTokens.AccessTokensFind(token)
-}
-
-// AccessTokensCreate creates a new AccessToken.
-func (e *Empire) AccessTokensCreate(accessToken *AccessToken) (*AccessToken, error) {
-	return e.accessTokens.AccessTokensCreate(accessToken)
 }
 
 // AppsFind finds the first app matching the query.
@@ -222,6 +245,69 @@ func (e *Empire) Config(app *App) (*Config, error) {
 	}
 
 	return c, nil
+}
+
+type SetMaintenanceModeOpts struct {
+	// User performing the action.
+	User *User
+
+	// The associated app.
+	App *App
+
+	// Wheather maintenance mode should be enabled or not.
+	Maintenance bool
+
+	// Commit message
+	Message string
+}
+
+func (opts SetMaintenanceModeOpts) Event() MaintenanceEvent {
+	return MaintenanceEvent{
+		User:        opts.User.Name,
+		App:         opts.App.Name,
+		Maintenance: opts.Maintenance,
+		Message:     opts.Message,
+	}
+}
+
+func (opts SetMaintenanceModeOpts) Validate(e *Empire) error {
+	return e.requireMessages(opts.Message)
+}
+
+// SetMaintenanceMode enables or disables "maintenance mode" on the app. When an
+// app is in maintenance mode, all processes will be scaled down to 0. When
+// taken out of maintenance mode, all processes will be scaled up back to their
+// existing values.
+func (e *Empire) SetMaintenanceMode(ctx context.Context, opts SetMaintenanceModeOpts) error {
+	if err := opts.Validate(e); err != nil {
+		return err
+	}
+
+	tx := e.db.Begin()
+
+	app := opts.App
+
+	app.Maintenance = opts.Maintenance
+
+	if err := appsUpdate(tx, app); err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	if err := e.releases.ReleaseApp(ctx, tx, app, nil); err != nil {
+		tx.Rollback()
+		if err == ErrNoReleases {
+			return nil
+		}
+
+		return err
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		return err
+	}
+
+	return e.PublishEvent(opts.Event())
 }
 
 // SetOpts are options provided when setting new config vars on an app.
@@ -388,11 +474,10 @@ type RunOpts struct {
 	// Commit message
 	Message string
 
-	// If provided, input will be read from this.
-	Input io.Reader
-
-	// If provided, output will be written to this.
-	Output io.Writer
+	// Input/Output streams. The caller is responsible for closing these
+	// streams.
+	Stdin          io.Reader
+	Stdout, Stderr io.Writer
 
 	// Extra environment variables to set.
 	Env map[string]string
@@ -403,7 +488,7 @@ type RunOpts struct {
 
 func (opts RunOpts) Event() RunEvent {
 	var attached bool
-	if opts.Output != nil {
+	if opts.Stdout != nil || opts.Stderr != nil {
 		attached = true
 	}
 
@@ -429,7 +514,7 @@ func (e *Empire) Run(ctx context.Context, opts RunOpts) error {
 		return err
 	}
 
-	if opts.Input != nil && opts.Output != nil && e.RunRecorder != nil {
+	if e.RunRecorder != nil && (opts.Stdout != nil || opts.Stderr != nil) {
 		w, err := e.RunRecorder()
 		if err != nil {
 			return err
@@ -448,7 +533,12 @@ func (e *Empire) Run(ctx context.Context, opts RunOpts) error {
 
 		// Write output to both the original output as well as the
 		// record.
-		opts.Output = io.MultiWriter(w, opts.Output)
+		if opts.Stdout != nil {
+			opts.Stdout = io.MultiWriter(w, opts.Stdout)
+		}
+		if opts.Stderr != nil {
+			opts.Stderr = io.MultiWriter(w, opts.Stderr)
+		}
 	}
 
 	if err := e.PublishEvent(event); err != nil {
@@ -674,11 +764,22 @@ func (e *Empire) StreamLogs(app *App, w io.Writer, duration time.Duration) error
 	return nil
 }
 
+type CertsAttachOpts struct {
+	// The certificate to attach.
+	Cert string
+	// The app to attach the cert to.
+	App *App
+
+	// An optional process to attach the cert to. If not provided, "web"
+	// will be used.
+	Process string
+}
+
 // CertsAttach attaches an SSL certificate to the app.
-func (e *Empire) CertsAttach(ctx context.Context, app *App, cert string) error {
+func (e *Empire) CertsAttach(ctx context.Context, opts CertsAttachOpts) error {
 	tx := e.db.Begin()
 
-	if err := e.certs.CertsAttach(ctx, tx, app, cert); err != nil {
+	if err := e.certs.CertsAttach(ctx, tx, opts); err != nil {
 		tx.Rollback()
 		return err
 	}
@@ -712,28 +813,4 @@ type MessageRequiredError struct{}
 
 func (e *MessageRequiredError) Error() string {
 	return "Missing required option: 'Message'"
-}
-
-// PullAndExtract returns a ProcfileExtractor that will pull the image using the
-// docker client, then attempt to extract the the Procfile, or fallback to the
-// CMD directive in the Dockerfile.
-func PullAndExtract(c *dockerutil.Client) ProcfileExtractor {
-	e := multiExtractor(
-		newFileExtractor(c),
-		newCMDExtractor(c),
-	)
-
-	return ProcfileExtractorFunc(func(ctx context.Context, img image.Image, w io.Writer) ([]byte, error) {
-		if err := c.PullImage(ctx, docker.PullImageOptions{
-			Registry:      img.Registry,
-			Repository:    img.Repository,
-			Tag:           img.Tag,
-			OutputStream:  w,
-			RawJSONStream: true,
-		}); err != nil {
-			return nil, err
-		}
-
-		return e.Extract(ctx, img, w)
-	})
 }

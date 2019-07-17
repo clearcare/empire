@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
@@ -13,12 +14,13 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/client"
+	"github.com/aws/aws-sdk-go/service/cloudformation"
 	"github.com/aws/aws-sdk-go/service/ecs"
 	"github.com/aws/aws-sdk-go/service/route53"
 	"github.com/remind101/empire/pkg/arn"
 	"github.com/remind101/empire/pkg/bytesize"
 	"github.com/remind101/empire/pkg/troposphere"
-	"github.com/remind101/empire/scheduler"
+	"github.com/remind101/empire/twelvefactor"
 )
 
 var (
@@ -28,13 +30,66 @@ var (
 	Join   = troposphere.Join
 )
 
+// Load balancer types
 const (
-	// For HTTP/HTTPS/TCP services, we allocate an ELB and map it's instance port to
-	// the container port. This is the port that processes within the container
-	// should bind to. This value is also exposed to the container through the PORT
-	// environment variable.
-	ContainerPort = 8080
+	classicLoadBalancer     = "elb"
+	applicationLoadBalancer = "alb"
+)
 
+// Returns the type of load balancer that should be used (ELB/ALB).
+func loadBalancerType(app *twelvefactor.Manifest, process *twelvefactor.Process) string {
+	check := []string{
+		"EMPIRE_X_LOAD_BALANCER_TYPE",
+		"LOAD_BALANCER_TYPE", // For backwards compatibility.
+	}
+	env := twelvefactor.Env(app, process)
+
+	for _, n := range check {
+		if v, ok := env[n]; ok {
+			return v
+		}
+	}
+
+	// Default when not set.
+	return classicLoadBalancer
+}
+
+// Returns the name of the CloudFormation resource that should be used to create
+// custom task definitions.
+func taskDefinitionResourceType(app *twelvefactor.Manifest) string {
+	check := []string{
+		"EMPIRE_X_TASK_DEFINITION_TYPE",
+		"ECS_TASK_DEFINITION", // For backwards compatibility.
+	}
+
+	for _, n := range check {
+		if v, ok := app.Env[n]; ok {
+			if v == "custom" {
+				return "Custom::ECSTaskDefinition"
+			}
+		}
+	}
+
+	// Default when not set.
+	return "AWS::ECS::TaskDefinition"
+}
+
+func taskRoleArn(app *twelvefactor.Manifest) *string {
+	check := []string{
+		"EMPIRE_X_TASK_ROLE_ARN",
+		"TASK_ROLE_ARN", // For backwards compatibility.
+	}
+
+	for _, n := range check {
+		if v, ok := app.Env[n]; ok {
+			return &v
+		}
+	}
+
+	return nil
+}
+
+const (
 	schemeInternal = "internal"
 	schemeExternal = "internet-facing"
 
@@ -58,6 +113,10 @@ type EmpireTemplate struct {
 
 	// The ECS cluster to run the services in.
 	Cluster string
+
+	// The VPC to create ALB target groups within. Should be the same VPC
+	// that ECS services will run within.
+	VpcId string
 
 	// The hosted zone to add CNAME's to.
 	HostedZone *route53.HostedZone
@@ -93,6 +152,9 @@ func (t *EmpireTemplate) Validate() error {
 		return errors.New(fmt.Sprintf("%s is required", n))
 	}
 
+	if t.VpcId == "" {
+		return r("VpcId")
+	}
 	if t.Cluster == "" {
 		return r("Cluster")
 	}
@@ -123,7 +185,7 @@ func (t *EmpireTemplate) Validate() error {
 
 // Execute builds the template, and writes it to w.
 func (t *EmpireTemplate) Execute(w io.Writer, data interface{}) error {
-	v, err := t.Build(data.(*scheduler.App))
+	v, err := t.Build(data.(*TemplateData))
 	if err != nil {
 		return err
 	}
@@ -142,7 +204,9 @@ func (t *EmpireTemplate) Execute(w io.Writer, data interface{}) error {
 }
 
 // Build builds a Go representation of a CloudFormation template for the app.
-func (t *EmpireTemplate) Build(app *scheduler.App) (*troposphere.Template, error) {
+func (t *EmpireTemplate) Build(data *TemplateData) (*troposphere.Template, error) {
+	app := data.Manifest
+
 	tmpl := troposphere.NewTemplate()
 
 	tmpl.Parameters["DNS"] = troposphere.Parameter{
@@ -188,14 +252,13 @@ func (t *EmpireTemplate) Build(app *scheduler.App) (*troposphere.Template, error
 
 		switch {
 		case p.Schedule != nil:
-			// To save space in the template, avoid adding the
-			// resources if the process is scaled down.
-			if p.Instances > 0 {
-				taskDefinition := t.addScheduledTask(tmpl, app, p)
-				scheduledProcesses[p.Type] = taskDefinition.Name
-			}
+			taskDefinition := t.addScheduledTask(tmpl, app, p)
+			scheduledProcesses[p.Type] = taskDefinition.Name
 		default:
-			service := t.addService(tmpl, app, p)
+			service, err := t.addService(tmpl, app, p, data.StackTags)
+			if err != nil {
+				return tmpl, err
+			}
 			serviceMappings = append(serviceMappings, Join("=", p.Type, Ref(service)))
 			deploymentMappings = append(deploymentMappings, Join("=", p.Type, GetAtt(service, "DeploymentId")))
 		}
@@ -212,7 +275,7 @@ func (t *EmpireTemplate) Build(app *scheduler.App) (*troposphere.Template, error
 	return tmpl, nil
 }
 
-func (t *EmpireTemplate) addTaskDefinition(tmpl *troposphere.Template, app *scheduler.App, p *scheduler.Process) (troposphere.NamedResource, *ContainerDefinitionProperties) {
+func (t *EmpireTemplate) addTaskDefinition(tmpl *troposphere.Template, app *twelvefactor.Manifest, p *twelvefactor.Process) (troposphere.NamedResource, *ContainerDefinitionProperties) {
 	key := processResourceName(p.Type)
 	// The task definition that will be used to run the ECS task.
 	taskDefinition := troposphere.NamedResource{
@@ -221,6 +284,22 @@ func (t *EmpireTemplate) addTaskDefinition(tmpl *troposphere.Template, app *sche
 
 	cd := t.ContainerDefinition(app, p)
 	containerDefinition := cloudformationContainerDefinition(cd)
+
+	// If provided in the app environment, this role will be used when
+	// running tasks.
+	taskRole := toInterface(taskRoleArn(app))
+
+	var placementConstraints []*PlacementConstraint
+	if v := p.ECS; v != nil {
+		if len(v.PlacementConstraints) > 0 {
+			for _, c := range v.PlacementConstraints {
+				placementConstraints = append(placementConstraints, &PlacementConstraint{
+					Type:       c.Type,
+					Expression: c.Expression,
+				})
+			}
+		}
+	}
 
 	var taskDefinitionProperties interface{}
 	taskDefinitionType := taskDefinitionResourceType(app)
@@ -247,6 +326,8 @@ func (t *EmpireTemplate) addTaskDefinition(tmpl *troposphere.Template, app *sche
 			ContainerDefinitions: []*ContainerDefinitionProperties{
 				containerDefinition,
 			},
+			TaskRoleArn:          taskRole,
+			PlacementConstraints: placementConstraints,
 		}
 	} else {
 		containerDefinition.Environment = cd.Environment
@@ -255,6 +336,8 @@ func (t *EmpireTemplate) addTaskDefinition(tmpl *troposphere.Template, app *sche
 			ContainerDefinitions: []*ContainerDefinitionProperties{
 				containerDefinition,
 			},
+			TaskRoleArn:          taskRole,
+			PlacementConstraints: placementConstraints,
 		}
 	}
 
@@ -267,11 +350,15 @@ func (t *EmpireTemplate) addTaskDefinition(tmpl *troposphere.Template, app *sche
 	return taskDefinition, containerDefinition
 }
 
-func (t *EmpireTemplate) addScheduledTask(tmpl *troposphere.Template, app *scheduler.App, p *scheduler.Process) troposphere.NamedResource {
+func (t *EmpireTemplate) addScheduledTask(tmpl *troposphere.Template, app *twelvefactor.Manifest, p *twelvefactor.Process) troposphere.NamedResource {
 	key := processResourceName(p.Type)
 
 	taskDefinition, _ := t.addTaskDefinition(tmpl, app, p)
 
+	state := "DISABLED"
+	if p.Quantity > 0 {
+		state = "ENABLED"
+	}
 	schedule := fmt.Sprintf("%sTrigger", key)
 	tmpl.Resources[schedule] = troposphere.Resource{
 		Type: "AWS::Events::Rule",
@@ -279,12 +366,12 @@ func (t *EmpireTemplate) addScheduledTask(tmpl *troposphere.Template, app *sched
 			"Description":        fmt.Sprintf("Rule to periodically trigger the `%s` scheduled task", p.Type),
 			"ScheduleExpression": scheduleExpression(p.Schedule),
 			"RoleArn":            t.serviceRoleArn(),
-			"State":              "ENABLED",
+			"State":              state,
 			"Targets": []interface{}{
 				map[string]interface{}{
 					"Arn":   GetAtt(runTaskFunction, "Arn"),
 					"Id":    "f",
-					"Input": Join("", `{"taskDefinition":"`, Ref(taskDefinition), `","count":`, Ref(scaleParameter(p.Type)), `,"cluster":"`, t.Cluster, `","startedBy": "`, app.ID, `"}`),
+					"Input": Join("", `{"taskDefinition":"`, Ref(taskDefinition), `","count":`, Ref(scaleParameter(p.Type)), `,"cluster":"`, t.Cluster, `","startedBy": "`, app.AppID, `"}`),
 				},
 			},
 		},
@@ -305,8 +392,11 @@ func (t *EmpireTemplate) addScheduledTask(tmpl *troposphere.Template, app *sched
 	return taskDefinition
 }
 
-func (t *EmpireTemplate) addService(tmpl *troposphere.Template, app *scheduler.App, p *scheduler.Process) (serviceName string) {
+func (t *EmpireTemplate) addService(tmpl *troposphere.Template, app *twelvefactor.Manifest, p *twelvefactor.Process, stackTags []*cloudformation.Tag) (serviceName string, err error) {
 	key := processResourceName(p.Type)
+
+	// Process specific tags to apply to resources.
+	tags := tagsFromLabels(p.Labels)
 
 	// The standard AWS::ECS::Service resource's default behavior is to wait
 	// for services to stabilize when you update them. While this is a
@@ -321,6 +411,7 @@ func (t *EmpireTemplate) addService(tmpl *troposphere.Template, app *scheduler.A
 
 	var portMappings []*PortMappingProperties
 
+	var serviceDependencies []string
 	loadBalancers := []map[string]interface{}{}
 	if p.Exposure != nil {
 		scheme := schemeInternal
@@ -333,74 +424,258 @@ func (t *EmpireTemplate) addService(tmpl *troposphere.Template, app *scheduler.A
 			subnets = t.ExternalSubnetIDs
 		}
 
-		instancePort := fmt.Sprintf("%s%dInstancePort", key, ContainerPort)
-		tmpl.Resources[instancePort] = troposphere.Resource{
-			Type:    "Custom::InstancePort",
-			Version: "1.0",
-			Properties: map[string]interface{}{
-				"ServiceToken": t.CustomResourcesTopic,
-			},
-		}
+		loadBalancerType := loadBalancerType(app, p)
 
-		listeners := []map[string]interface{}{
-			map[string]interface{}{
-				"LoadBalancerPort": 80,
-				"Protocol":         "http",
-				"InstancePort":     GetAtt(instancePort, "InstancePort"),
-				"InstanceProtocol": "http",
-			},
-		}
+		var (
+			loadBalancer          troposphere.NamedResource
+			canonicalHostedZoneId interface{}
+		)
 
-		if e, ok := p.Exposure.Type.(*scheduler.HTTPSExposure); ok {
-			var cert interface{}
-			if _, err := arn.Parse(e.Cert); err == nil {
-				cert = e.Cert
-			} else {
-				cert = Join("", "arn:aws:iam::", Ref("AWS::AccountId"), ":server-certificate/", e.Cert)
+		switch loadBalancerType {
+		case applicationLoadBalancer:
+			loadBalancer = troposphere.NamedResource{
+				Name: fmt.Sprintf("%sApplicationLoadBalancer", key),
+				Resource: troposphere.Resource{
+					Type: "AWS::ElasticLoadBalancingV2::LoadBalancer",
+					Properties: map[string]interface{}{
+						"Scheme":         scheme,
+						"SecurityGroups": []string{sg},
+						"Subnets":        subnets,
+						"Tags":           append(stackTags, tags...),
+					},
+				},
+			}
+			canonicalHostedZoneId = GetAtt(loadBalancer, "CanonicalHostedZoneID")
+
+			tmpl.AddResource(loadBalancer)
+
+			targetGroup := fmt.Sprintf("%sTargetGroup", key)
+			tmpl.Resources[targetGroup] = troposphere.Resource{
+				Type: "AWS::ElasticLoadBalancingV2::TargetGroup",
+				Properties: map[string]interface{}{
+					"Port":     65535, // Not used. ECS sets a port override when registering targets.
+					"Protocol": "HTTP",
+					"VpcId":    t.VpcId,
+					"Tags":     append(stackTags, tags...),
+				},
 			}
 
-			listeners = append(listeners, map[string]interface{}{
-				"LoadBalancerPort": 443,
-				"Protocol":         "https",
-				"InstancePort":     GetAtt(instancePort, "InstancePort"),
-				"SSLCertificateId": cert,
-				"InstanceProtocol": "http",
+			// Add a port mapping for each unique container port.
+			containerPorts := make(map[int]bool)
+			for _, port := range p.Exposure.Ports {
+				if ok := containerPorts[port.Container]; !ok {
+					containerPorts[port.Container] = true
+					portMappings = append(portMappings, &PortMappingProperties{
+						ContainerPort: port.Container,
+						HostPort:      0,
+					})
+				}
+			}
+
+			// Unlike ELB, ALB can only route to a single container
+			// port, when dynamic ports are used. Thus, we have to
+			// ensure that all of the defined ports map to the same
+			// container port.
+			//
+			// ELB can route to multiple container ports, because a
+			// listener can directly point to a container port,
+			// through an instance port:
+			//
+			//	Listener Port => Instance Port => Container Port
+			if len(containerPorts) > 1 {
+				err = fmt.Errorf("AWS Application Load Balancers can only map listeners to a single container port. %d unique container ports were defined: [%s]", len(p.Exposure.Ports), fmtPorts(p.Exposure.Ports))
+				return
+			}
+
+			// Add a listener for each port.
+			for _, port := range p.Exposure.Ports {
+				listener := troposphere.NamedResource{
+					Name: fmt.Sprintf("%sPort%dListener", loadBalancer.Name, port.Host),
+				}
+
+				switch e := port.Protocol.(type) {
+				case *twelvefactor.HTTP:
+					listener.Resource = troposphere.Resource{
+						Type: "AWS::ElasticLoadBalancingV2::Listener",
+						Properties: map[string]interface{}{
+							"LoadBalancerArn": Ref(loadBalancer),
+							"Port":            port.Host,
+							"Protocol":        "HTTP",
+							"DefaultActions": []interface{}{
+								map[string]interface{}{
+									"TargetGroupArn": Ref(targetGroup),
+									"Type":           "forward",
+								},
+							},
+						},
+					}
+				case *twelvefactor.HTTPS:
+					var cert interface{}
+					if _, err := arn.Parse(e.Cert); err == nil {
+						cert = e.Cert
+					} else {
+						cert = Join("", "arn:aws:iam::", Ref("AWS::AccountId"), ":server-certificate/", e.Cert)
+					}
+
+					listener.Resource = troposphere.Resource{
+						Type: "AWS::ElasticLoadBalancingV2::Listener",
+						Properties: map[string]interface{}{
+							"Certificates": []interface{}{
+								map[string]interface{}{
+									"CertificateArn": cert,
+								},
+							},
+							"LoadBalancerArn": Ref(loadBalancer),
+							"Port":            port.Host,
+							"Protocol":        "HTTPS",
+							"DefaultActions": []interface{}{
+								map[string]interface{}{
+									"TargetGroupArn": Ref(targetGroup),
+									"Type":           "forward",
+								},
+							},
+						},
+					}
+				default:
+					err = fmt.Errorf("%s listeners are not supported with AWS Application Load Balancing", e.Protocol())
+					return
+				}
+				tmpl.AddResource(listener)
+				serviceDependencies = append(serviceDependencies, listener.Name)
+			}
+
+			loadBalancers = append(loadBalancers, map[string]interface{}{
+				"ContainerName":  p.Type,
+				"ContainerPort":  p.Exposure.Ports[0].Container,
+				"TargetGroupArn": Ref(targetGroup),
+			})
+		default:
+			loadBalancer = troposphere.NamedResource{
+				Name: fmt.Sprintf("%sLoadBalancer", key),
+			}
+			canonicalHostedZoneId = GetAtt(loadBalancer, "CanonicalHostedZoneNameID")
+
+			listeners := []map[string]interface{}{}
+
+			// Add a port mapping for each unique container port.
+			instancePorts := make(map[int]troposphere.NamedResource)
+			for _, port := range p.Exposure.Ports {
+				if _, ok := instancePorts[port.Container]; !ok {
+					instancePort := troposphere.NamedResource{
+						Name: fmt.Sprintf("%s%dInstancePort", key, port.Container),
+						Resource: troposphere.Resource{
+							Type:    "Custom::InstancePort",
+							Version: "1.0",
+							Properties: map[string]interface{}{
+								"ServiceToken": t.CustomResourcesTopic,
+							},
+						},
+					}
+					portMappings = append(portMappings, &PortMappingProperties{
+						ContainerPort: port.Container,
+						HostPort:      GetAtt(instancePort, "InstancePort"),
+					})
+					tmpl.AddResource(instancePort)
+					instancePorts[port.Container] = instancePort
+				}
+			}
+
+			for _, port := range p.Exposure.Ports {
+				instancePort := instancePorts[port.Container]
+
+				switch e := port.Protocol.(type) {
+				case *twelvefactor.TCP:
+					listeners = append(listeners, map[string]interface{}{
+						"LoadBalancerPort": port.Host,
+						"Protocol":         "tcp",
+						"InstancePort":     GetAtt(instancePort, "InstancePort"),
+						"InstanceProtocol": "tcp",
+					})
+				case *twelvefactor.SSL:
+					var cert interface{}
+					if _, err := arn.Parse(e.Cert); err == nil {
+						cert = e.Cert
+					} else {
+						cert = Join("", "arn:aws:iam::", Ref("AWS::AccountId"), ":server-certificate/", e.Cert)
+					}
+
+					listeners = append(listeners, map[string]interface{}{
+						"LoadBalancerPort": port.Host,
+						"Protocol":         "ssl",
+						"InstancePort":     GetAtt(instancePort, "InstancePort"),
+						"SSLCertificateId": cert,
+						"InstanceProtocol": "tcp",
+					})
+				case *twelvefactor.HTTP:
+					listeners = append(listeners, map[string]interface{}{
+						"LoadBalancerPort": port.Host,
+						"Protocol":         "http",
+						"InstancePort":     GetAtt(instancePort, "InstancePort"),
+						"InstanceProtocol": "http",
+					})
+				case *twelvefactor.HTTPS:
+					var cert interface{}
+					if _, err := arn.Parse(e.Cert); err == nil {
+						cert = e.Cert
+					} else {
+						cert = Join("", "arn:aws:iam::", Ref("AWS::AccountId"), ":server-certificate/", e.Cert)
+					}
+
+					listeners = append(listeners, map[string]interface{}{
+						"LoadBalancerPort": port.Host,
+						"Protocol":         "https",
+						"InstancePort":     GetAtt(instancePort, "InstancePort"),
+						"SSLCertificateId": cert,
+						"InstanceProtocol": "http",
+					})
+				}
+			}
+
+			loadBalancer.Resource = troposphere.Resource{
+				Type: "AWS::ElasticLoadBalancing::LoadBalancer",
+				Properties: map[string]interface{}{
+					"Scheme":         scheme,
+					"SecurityGroups": []string{sg},
+					"Subnets":        subnets,
+					"Listeners":      listeners,
+					"CrossZone":      true,
+					"Tags":           tags,
+					"ConnectionDrainingPolicy": map[string]interface{}{
+						"Enabled": true,
+						"Timeout": defaultConnectionDrainingTimeout,
+					},
+				},
+			}
+			tmpl.AddResource(loadBalancer)
+
+			loadBalancers = append(loadBalancers, map[string]interface{}{
+				"ContainerName":    p.Type,
+				"ContainerPort":    p.Exposure.Ports[0].Container,
+				"LoadBalancerName": Ref(loadBalancer),
 			})
 		}
 
-		portMappings = append(portMappings, &PortMappingProperties{
-			ContainerPort: ContainerPort,
-			HostPort:      GetAtt(instancePort, "InstancePort"),
-		})
-		p.Env["PORT"] = fmt.Sprintf("%d", ContainerPort)
-
-		loadBalancer := fmt.Sprintf("%sLoadBalancer", key)
-		loadBalancers = append(loadBalancers, map[string]interface{}{
-			"ContainerName":    p.Type,
-			"ContainerPort":    ContainerPort,
-			"LoadBalancerName": Ref(loadBalancer),
-		})
-		tmpl.Resources[loadBalancer] = troposphere.Resource{
-			Type: "AWS::ElasticLoadBalancing::LoadBalancer",
-			Properties: map[string]interface{}{
-				"Scheme":         scheme,
-				"SecurityGroups": []string{sg},
-				"Subnets":        subnets,
-				"Listeners":      listeners,
-				"CrossZone":      true,
-				"Tags": []map[string]string{
-					map[string]string{
-						"Key":   "empire.app.process",
-						"Value": p.Type,
+		alias := troposphere.NamedResource{
+			Name: fmt.Sprintf("%sAlias", key),
+			Resource: troposphere.Resource{
+				Type:      "AWS::Route53::RecordSet",
+				Condition: "DNSCondition",
+				Properties: map[string]interface{}{
+					"HostedZoneId": *t.HostedZone.Id,
+					"Name":         fmt.Sprintf("%s.%s.%s", p.Type, app.Name, *t.HostedZone.Name),
+					"Type":         "A",
+					"AliasTarget": map[string]interface{}{
+						"DNSName":              GetAtt(loadBalancer, "DNSName"),
+						"EvaluateTargetHealth": "true",
+						"HostedZoneId":         canonicalHostedZoneId,
 					},
-				},
-				"ConnectionDrainingPolicy": map[string]interface{}{
-					"Enabled": true,
-					"Timeout": defaultConnectionDrainingTimeout,
 				},
 			},
 		}
+		tmpl.AddResource(alias)
 
+		// DEPRECATED: This was used in the world where only the "web"
+		// process could be exposed.
 		if p.Type == "web" {
 			tmpl.Resources["CNAME"] = troposphere.Resource{
 				Type:      "AWS::Route53::RecordSet",
@@ -421,7 +696,6 @@ func (t *EmpireTemplate) addService(tmpl *troposphere.Template, app *scheduler.A
 	containerDefinition.DockerLabels[restartLabel] = Ref(restartParameter)
 	containerDefinition.PortMappings = portMappings
 
-	service := fmt.Sprintf("%sService", key)
 	serviceProperties := map[string]interface{}{
 		"Cluster":        t.Cluster,
 		"DesiredCount":   Ref(scaleParameter(p.Type)),
@@ -430,14 +704,33 @@ func (t *EmpireTemplate) addService(tmpl *troposphere.Template, app *scheduler.A
 		"ServiceName":    fmt.Sprintf("%s-%s", app.Name, p.Type),
 		"ServiceToken":   t.CustomResourcesTopic,
 	}
+	if v := p.ECS; v != nil {
+		if len(v.PlacementStrategy) > 0 {
+			var placementStrategy []interface{}
+			for _, c := range v.PlacementStrategy {
+				placementStrategy = append(placementStrategy, map[string]interface{}{
+					"Type":  c.Type,
+					"Field": c.Field,
+				})
+			}
+			serviceProperties["PlacementStrategy"] = placementStrategy
+		}
+	}
 	if len(loadBalancers) > 0 {
 		serviceProperties["Role"] = t.ServiceRole
 	}
-	tmpl.Resources[service] = troposphere.Resource{
-		Type:       ecsServiceType,
-		Properties: serviceProperties,
+	service := troposphere.NamedResource{
+		Name: fmt.Sprintf("%sService", key),
+		Resource: troposphere.Resource{
+			Type:       ecsServiceType,
+			Properties: serviceProperties,
+		},
 	}
-	return service
+	if len(serviceDependencies) > 0 {
+		service.Resource.DependsOn = serviceDependencies
+	}
+	tmpl.AddResource(service)
+	return service.Name, nil
 }
 
 // If the ServiceRole option is not an ARN, it will return a CloudFormation
@@ -458,7 +751,7 @@ func (e ecsEnv) Less(i, j int) bool { return *e[i].Name < *e[j].Name }
 func (e ecsEnv) Swap(i, j int)      { e[i], e[j] = e[j], e[i] }
 
 // ContainerDefinition generates an ECS ContainerDefinition for a process.
-func (t *EmpireTemplate) ContainerDefinition(app *scheduler.App, p *scheduler.Process) *ecs.ContainerDefinition {
+func (t *EmpireTemplate) ContainerDefinition(app *twelvefactor.Manifest, p *twelvefactor.Process) *ecs.ContainerDefinition {
 	command := []*string{}
 	for _, s := range p.Command {
 		ss := s
@@ -466,7 +759,7 @@ func (t *EmpireTemplate) ContainerDefinition(app *scheduler.App, p *scheduler.Pr
 	}
 
 	labels := make(map[string]*string)
-	for k, v := range scheduler.Labels(app, p) {
+	for k, v := range twelvefactor.Labels(app, p) {
 		labels[k] = aws.String(v)
 	}
 
@@ -487,8 +780,8 @@ func (t *EmpireTemplate) ContainerDefinition(app *scheduler.App, p *scheduler.Pr
 		Command:          command,
 		Image:            aws.String(p.Image.String()),
 		Essential:        aws.Bool(true),
-		Memory:           aws.Int64(int64(p.MemoryLimit / bytesize.MB)),
-		Environment:      sortedEnvironment(scheduler.Env(app, p)),
+		Memory:           aws.Int64(int64(p.Memory / bytesize.MB)),
+		Environment:      sortedEnvironment(twelvefactor.Env(app, p)),
 		LogConfiguration: t.LogConfiguration,
 		DockerLabels:     labels,
 		Ulimits:          ulimits,
@@ -571,9 +864,9 @@ func sortedEnvironment(environment map[string]string) []*ecs.KeyValuePair {
 	return e
 }
 
-func scheduleExpression(s scheduler.Schedule) string {
+func scheduleExpression(s twelvefactor.Schedule) string {
 	switch v := s.(type) {
-	case scheduler.CRONSchedule:
+	case twelvefactor.CRONSchedule:
 		return fmt.Sprintf("cron(%s)", v)
 	case time.Duration:
 		var units = "minute"
@@ -585,15 +878,6 @@ func scheduleExpression(s scheduler.Schedule) string {
 	default:
 		panic("unknown scheduler expression")
 	}
-}
-
-// Returns the name of the CloudFormation resource that should be used to create
-// custom task definitions.
-func taskDefinitionResourceType(app *scheduler.App) string {
-	if app.Env["ECS_TASK_DEFINITION"] == "custom" {
-		return "Custom::ECSTaskDefinition"
-	}
-	return "AWS::ECS::TaskDefinition"
 }
 
 // runTaskResource returns a troposphere resource that will create a lambda
@@ -611,6 +895,51 @@ func runTaskResource(role interface{}) troposphere.Resource {
 			},
 		},
 	}
+}
+
+// fmtPorts implements the fmt.Stringer interface to show a map of container
+// port to host port.
+type fmtPorts []twelvefactor.Port
+
+func (p fmtPorts) String() string {
+	var mappings []string
+	for _, port := range p {
+		mappings = append(mappings, fmt.Sprintf("%d => %d", port.Host, port.Container))
+	}
+	return strings.Join(mappings, ", ")
+}
+
+// cloudformationTags implements the sort.Interface interface to sort the labels
+// variables by key in alphabetical order.
+type cloudformationTags []*cloudformation.Tag
+
+func (e cloudformationTags) Len() int           { return len(e) }
+func (e cloudformationTags) Less(i, j int) bool { return *e[i].Key < *e[j].Key }
+func (e cloudformationTags) Swap(i, j int)      { e[i], e[j] = e[j], e[i] }
+
+// tagsFromLabels generates a list of CloudFormation tags from the labels, it
+// also sorts the tags by key.
+func tagsFromLabels(labels map[string]string) []*cloudformation.Tag {
+	tags := cloudformationTags{}
+	for k, v := range labels {
+		tags = append(tags, &cloudformation.Tag{Key: aws.String(k), Value: aws.String(v)})
+	}
+	sort.Sort(tags)
+	return tags
+}
+
+// This is a helpful function to check if any type is nil. We cannot simply
+// check `v == nil` because it will return true, even if the underlying type is
+// nil. Instead, we have to use reflection to check if the underlying value is
+// nil.
+//
+// See https://play.golang.org/p/aq3DmMZ_P8
+func toInterface(v interface{}) interface{} {
+	if reflect.ValueOf(v).IsNil() {
+		return nil
+	}
+
+	return v
 }
 
 // A simple lambda function that can be used to trigger an ecs.RunTask.

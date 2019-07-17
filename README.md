@@ -21,7 +21,7 @@ To use Empire, you'll need to have an ECS cluster running. See the [quickstart g
 Empire aims to make it trivially easy to deploy a container based microservices architecture, without all of the complexities of managing systems like Mesos or Kubernetes. ECS takes care of much of that work, but Empire attempts to enhance the interface to ECS for deploying and maintaining applications, allowing you to deploy Docker images as easily as:
 
 ```console
-$ emp deploy remind101/acme-inc:latest
+$ emp deploy remind101/acme-inc:master
 ```
 
 ### Heroku API compatibility
@@ -46,118 +46,13 @@ Apps default to only being exposed internally, unless you add a custom domain to
 
 ### Deploying
 
-Any tagged Docker image can be deployed to Empire as an app. Empire doesn't enforce how you tag your Docker images, but we recommend tagging the image with the git sha that it was built from, and deploying that. We have a tool for performing deployments called [Tugboat][tugboat] that supports deploying Docker images to Empire.
+Any tagged Docker image can be deployed to Empire as an app. Empire doesn't enforce how you tag your Docker images, but we recommend tagging the image with the git sha that it was built from (any any immutable identifier), and deploying that.
 
 When you deploy a Docker image to Empire, it will extract a `Procfile` from the WORKDIR. Like Heroku, you can specify different process types that compose your service (e.g. `web` and `worker`), and scale them individually. Each process type in the Procfile maps directly to an ECS Service.
 
-**Caveats**
+## Contributing
 
-Because `docker run` does not exec commands within a shell, commands specified within the Procfile will also not be exec'd within a shell. This means that you cannot specify environment variables in the Procfile. The following is not valid:
-
-```
-web: acme-inc server -port=$PORT
-```
-
-If you need to specify environment variables as part of the command, we recommend splitting out your Procfile commands into small bash shims instead:
-
-```
-web: ./bin/web
-```
-
-```bash
-#!/bin/bash
-
-set -e
-
-exec acme-inc server -port=$PORT
-```
-
-## Tests
-
-Unit tests live alongside each go file as `_test.go`.
-
-There is also a `tests` directory that contains integration and functional tests that tests the system using the [heroku-go][heroku-go] client and the [emp][emp] command.
-
-To get started, run:
-
-```console
-$ export GO15VENDOREXPERIMENT=1
-$ make bootstrap
-```
-
-The bootstrap command assumes you have a running postgres server. It will create a database called `empire`
-using the postgres client connection defaults.
-
-To run the tests:
-
-```console
-$ make test
-```
-
-## Development
-
-If you want to contribute to Empire, you may end up wanting to run a local instance against an ECS cluster. Doing this is relatively easy:
-
-1. Ensure that you have the AWS CLI installed and configured.
-2. Ensure that you accepted the terms and conditions for the official ECS AMI:
-
-   https://aws.amazon.com/marketplace/ordering?productId=4ce33fd9-63ff-4f35-8d3a-939b641f1931&ref_=dtl_psb_continue&region=us-east-1
-
-   Also check that the offical ECS AMI ID for US East matches with the one in [cloudformation.json](./docs/cloudformation.json): https://github.com/remind101/empire/blob/master/docs/cloudformation.json#L20
-
-3. Run docker-machine and export the environment variables so Empire can connect:
-
-   ```console
-   $ docker-machine start default
-   $ eval "$(docker-machine env default)"
-   ```
-4. Run the bootstrap script, which will create a cloudformation stack, ecs cluster and populate a .env file:
-
-   ```console
-   $ ./bin/bootstrap
-   ```
-5. Run Empire with [docker-compose](https://docs.docker.com/compose/):
-
-   ```console
-   $ docker-compose up db # Only need to do this the first time, so that the db can initialize.
-   $ docker-compose up
-   ```
-
-   **NOTE**: You might need to run this twice the first time you start it up, to give the postgres container time to initialize.
-6. [Install the emp CLI](./cmd/emp#installation).
-
-Empire will be available at `http://$(docker-machine ip default):8080` and you can point the CLI there.
-
-```console
-$ export EMPIRE_API_URL=http://$(docker-machine ip default):8080
-$ emp deploy remind101/acme-inc
-```
-
-### Vendoring
-
-Empire follows Go's convention of vendoring third party dependencies. We use the Go 1.5+ [vendor expirement](https://blog.gopheracademy.com/advent-2015/vendor-folder/), and manage the `./vendor/` directory via [govendor](https://github.com/kardianos/govendor).
-
-When you add a new dependency, be sure to vendor it with govendor:
-
-```console
-$ govendor add <package>
-```
-
-### Releasing
-
-Perform the following steps when releasing a new version:
-
-1. Create a new branch `release-VERSION`.
-2. Bump the version number with `make bump` (this will add a commit to the branch).
-3. Change `HEAD` -> `VERSION` in [CHANGELOG.md](./CHANGELOG.md).
-4. Open a PR to review.
-5. Once merged into master, wait for the Conveyor build to complete.
-6. Finally, tag the commit with the version as `v<VERSION>`. This will trigger CircleCI to:
-   * Tag the image in Docker Hub with the version.
-   * Build Linux and OS X versions of the CLI and Daemon.
-   * Create a new GitHub Release and upload the artifacts.
-7. Update the new GitHub Release to be human readable.
-8. Open a PR against Homebrew to update the emp CLI: https://github.com/Homebrew/homebrew-core/blob/master/Formula/emp.rb
+Pull requests are more than welcome! For help with setting up a development environment, see [CONTRIBUTING.md](./CONTRIBUTING.md)
 
 ## Community
 

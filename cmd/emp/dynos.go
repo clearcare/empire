@@ -19,9 +19,10 @@ var cmdDynos = &Command{
 	Alias:    "dynos",
 	NeedsApp: true,
 	Category: "dyno",
+	NumArgs:  0,
 	Short:    "list processes",
 	Long: `
-Lists processes. Shows the name, size, state, age, and command.
+Lists processes. Shows the name, size, host, state, age, and command.
 
 Examples:
 
@@ -35,10 +36,7 @@ Examples:
 func runDynos(cmd *Command, args []string) {
 	w := tabwriter.NewWriter(os.Stdout, 1, 2, 2, ' ', 0)
 	defer w.Flush()
-	if len(args) != 0 {
-		cmd.PrintUsage()
-		os.Exit(2)
-	}
+	cmd.AssertNumArgsCorrect(args)
 
 	listDynos(w)
 }
@@ -58,6 +56,7 @@ func listDynos(w io.Writer) {
 func listDyno(w io.Writer, d *heroku.Dyno) {
 	listRec(w,
 		d.Name,
+		d.Host.Id,
 		d.Size,
 		d.State,
 		prettyDuration{dynoAge(d)},

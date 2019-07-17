@@ -3,12 +3,78 @@ package empire
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
+	"sort"
 
 	"github.com/lib/pq/hstore"
+	"github.com/remind101/empire/internal/migrate"
 	"github.com/remind101/empire/pkg/constraints"
 	"github.com/remind101/empire/procfile"
-	"github.com/remind101/migrate"
 )
+
+const (
+	DefaultInstancePortPoolStart = 9000
+	DefaultInstancePortPoolEnd   = 10000
+)
+
+// DefaultSchema is the default Schema that will be used to migrate the database
+// if none is provided.
+var DefaultSchema = &Schema{
+	InstancePortPool: &InstancePortPool{
+		Start: DefaultInstancePortPoolStart,
+		End:   DefaultInstancePortPoolEnd,
+	},
+}
+
+type InstancePortPool struct {
+	Start, End uint
+}
+
+type Schema struct {
+	// For legacy ELB's (not ALB) Empire manages a pool of host ports to
+	// ensure that all applications have a unique port on the EC2 instance.
+	// This option specifies the beginning and end of that range.
+	InstancePortPool *InstancePortPool
+}
+
+// latestSchema returns the schema version that this version of Empire should be
+// using.
+func (s *Schema) latestSchema() int {
+	migrations := s.migrations()
+	return migrations[len(migrations)-1].ID
+}
+
+func (s *Schema) migrations() []migrate.Migration {
+	ports := migrate.Migration{
+		ID: 4,
+		Up: func(tx *sql.Tx) error {
+			const table = `CREATE TABLE ports (
+  id uuid NOT NULL DEFAULT uuid_generate_v4() primary key,
+  port integer,
+  app_id uuid references apps(id) ON DELETE SET NULL
+)`
+			if _, err := tx.Exec(table); err != nil {
+				return fmt.Errorf("unable to create ports table: %v", err)
+			}
+
+			ports := fmt.Sprintf(`INSERT INTO ports (port) (SELECT generate_series(%d,%d))`, s.InstancePortPool.Start, s.InstancePortPool.End)
+
+			if _, err := tx.Exec(ports); err != nil {
+				return fmt.Errorf("unable to generate a series of instance ports: %v", err)
+			}
+
+			return nil
+		},
+		Down: migrate.Queries([]string{
+			`DROP TABLE ports CASCADE`,
+		}),
+	}
+
+	migrations := migrate.ByID(append(migrations, ports))
+	sort.Sort(migrations)
+
+	return migrations
+}
 
 var migrations = []migrate.Migration{
 	{
@@ -125,21 +191,6 @@ var migrations = []migrate.Migration{
   command text NOT NULL,
   updated_at timestamp without time zone default (now() at time zone 'utc')
 )`,
-		}),
-	},
-	{
-		ID: 4,
-		Up: migrate.Queries([]string{
-			`CREATE TABLE ports (
-  id uuid NOT NULL DEFAULT uuid_generate_v4() primary key,
-  port integer,
-  app_id uuid references apps(id) ON DELETE SET NULL
-)`,
-			`-- Insert 1000 ports
-INSERT INTO ports (port) (SELECT generate_series(9000,10000))`,
-		}),
-		Down: migrate.Queries([]string{
-			`DROP TABLE ports CASCADE`,
 		}),
 	},
 	{
@@ -560,10 +611,72 @@ ALTER TABLE apps ADD COLUMN exposure TEXT NOT NULL default 'private'`,
 			`DROP TABLE ecs_environment`,
 		}),
 	},
-}
 
-// latestSchema returns the schema version that this version of Empire should be
-// using.
-func latestSchema() int {
-	return migrations[len(migrations)-1].ID
+	// This migration migrates the cert storage from a single string column
+	// to a mapping of process name to cert name.
+	{
+		ID: 19,
+		Up: func(tx *sql.Tx) error {
+			_, err := tx.Exec(`ALTER TABLE apps ADD COLUMN certs json`)
+			if err != nil {
+				return fmt.Errorf("error adding certs column: %v", err)
+			}
+
+			rows, err := tx.Query(`SELECT id, cert FROM apps WHERE cert is not null and cert != ''`)
+			if err != nil {
+				return fmt.Errorf("error querying app certs: %v", err)
+			}
+			defer rows.Close()
+
+			// maps an app id to it's cert.
+			certs := make(map[string]string)
+			for rows.Next() {
+				var appID, cert string
+				if err := rows.Scan(&appID, &cert); err != nil {
+					return fmt.Errorf("error scanning row: %v", err)
+				}
+				certs[appID] = cert
+			}
+
+			for appID, cert := range certs {
+				raw, err := json.Marshal(map[string]string{"web": cert})
+				if err != nil {
+					return fmt.Errorf("error generating cert map for app %s: %v", appID, err)
+				}
+
+				_, err = tx.Exec(`UPDATE apps SET certs = $1 WHERE id = $2`, raw, appID)
+				if err != nil {
+					return fmt.Errorf("error updating certs column on app %s: %v", appID, err)
+				}
+			}
+
+			_, err = tx.Exec(`ALTER TABLE apps DROP COLUMN cert`)
+			if err != nil {
+				return fmt.Errorf("error dropping old cert column: %v", err)
+			}
+
+			return nil
+		},
+		Down: migrate.Queries([]string{
+			`ALTER TABLE apps DROP COLUMN certs`,
+			`ALTER TABLE apps ADD COLUMN cert text`,
+		}),
+	},
+
+	// This migration migrates the cert storage from a single string column
+	// to a mapping of process name to cert name.
+	{
+		ID: 20,
+		Up: func(tx *sql.Tx) error {
+			_, err := tx.Exec(`ALTER TABLE apps ADD COLUMN maintenance bool NOT NULL DEFAULT false`)
+			if err != nil {
+				return fmt.Errorf("error adding maintenance column: %v", err)
+			}
+
+			return nil
+		},
+		Down: migrate.Queries([]string{
+			`ALTER TABLE apps DROP COLUMN maintenance`,
+		}),
+	},
 }

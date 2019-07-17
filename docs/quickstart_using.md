@@ -33,7 +33,7 @@ Good - we haven't deployed any apps, so we shouldn't see any. Lets deploy our fi
 
 ```console
 $ emp deploy remind101/acme-inc:master
-Pulling repository remind101/acme-inc
+master: Pulling from remind101/acme-inc
 345c7524bc96: Download complete
 a1dd7097a8e8: Download complete
 23debee88b99: Download complete
@@ -41,11 +41,15 @@ a1dd7097a8e8: Download complete
 c7388ff7ab91: Download complete
 78fb106ed050: Download complete
 133fcef559c4: Download complete
+Digest: sha256:c6f77d2098bc0e32aef3102e71b51831a9083dd9356a0ccadca860596a1e9007
 Status: Downloaded newer image for remind101/acme-inc:master
+Status: Resolved remind101/acme-inc:master to remind101/acme-inc@sha256:c6f77d2098bc0e32aef3102e71b51831a9083dd9356a0ccadca860596a1e9007
+Status: Extracted Procfile from "/go/src/github.com/remind101/acme-inc/Procfile"
 Status: Created new release v1 for acme-inc
+Status: Finished processing events for release v1 of acme-inc
 ```
 
-So what just happened? We just told the Empire API to go out and get the 'master' tagged image from the remind101/acme-inc repository. The Empire daemon then pulled that image down from [hub.docker.com](http://hub.docker.com/), then extracted the *Procfile* from it to analyze what processes were available. Now lets see what apps we're running:
+So what just happened? We just told the Empire API to go out and get the 'master' tagged image from the remind101/acme-inc repository. The Empire daemon then pulled that image down from [hub.docker.com](http://hub.docker.com/), resolved the image to it's content-adressable identifier, then extracted the *Procfile* from it to analyze what processes were available. Now lets see what apps we're running:
 
 ```console
 $ emp apps
@@ -188,6 +192,13 @@ v3.worker.b8b06012-8354-49d6-8ae2-c6a84a73add8  1X  RUNNING   3m  "acme-inc work
 v3.web.5526a117-2746-4965-b4ea-c6f81810198f     1X  RUNNING   3m  "acme-inc server"
 v3.web.e7eff5a8-f5d0-49fd-8af9-569f5f7dbddf     1X  RUNNING   3m  "acme-inc server"
 v3.web.f6337ad7-2a24-4c36-a8fb-9253581a816d     1X  RUNNING   3m  "acme-inc server"
+```
+
+You'll notice that the scale of these processes is *1X*, which is shorthand for a CPU share of 256, and memory limited to 512mb.  There are other presets (*2X*, *PX*), but you don't have to use those - you can instead specify exactly how much memory and cpu each process should get:
+
+```console
+$ emp scale -a acme-inc web=3:512:1024mb
+Scaled acme-inc to web=3:512:1024mb.00.
 ```
 
 Finally, since we're done with acme-inc, we can destroy it - removing all tasks associated with it, as well as any load balancers and internal service discovery hostnames:

@@ -2,7 +2,6 @@ package empire_test
 
 import (
 	"errors"
-	"io"
 	"io/ioutil"
 	"sort"
 	"testing"
@@ -10,12 +9,14 @@ import (
 
 	"golang.org/x/net/context"
 
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/service/ecs"
 	"github.com/remind101/empire"
 	"github.com/remind101/empire/empiretest"
 	"github.com/remind101/empire/pkg/image"
+	"github.com/remind101/empire/pkg/timex"
 	"github.com/remind101/empire/procfile"
-	"github.com/remind101/empire/scheduler"
-	"github.com/remind101/pkg/timex"
+	"github.com/remind101/empire/twelvefactor"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 )
@@ -35,31 +36,6 @@ func TestMain(m *testing.M) {
 	empiretest.Run(m)
 }
 
-func TestEmpire_AccessTokens(t *testing.T) {
-	e := empiretest.NewEmpire(t)
-
-	token := &empire.AccessToken{
-		User: &empire.User{Name: "ejholmes"},
-	}
-	_, err := e.AccessTokensCreate(token)
-	assert.NoError(t, err)
-
-	token, err = e.AccessTokensFind(token.Token)
-	assert.NoError(t, err)
-	assert.NotNil(t, token)
-	assert.Equal(t, "ejholmes", token.User.Name)
-
-	token, err = e.AccessTokensFind("invalid")
-	assert.NoError(t, err)
-	assert.Nil(t, token)
-
-	token = &empire.AccessToken{
-		User: &empire.User{Name: ""},
-	}
-	_, err = e.AccessTokensCreate(token)
-	assert.Equal(t, empire.ErrUserName, err)
-}
-
 func TestEmpire_CertsAttach(t *testing.T) {
 	e := empiretest.NewEmpire(t)
 	s := new(mockScheduler)
@@ -74,12 +50,27 @@ func TestEmpire_CertsAttach(t *testing.T) {
 	assert.NoError(t, err)
 
 	cert := "serverCertificate"
-	err = e.CertsAttach(context.Background(), app, cert)
+	err = e.CertsAttach(context.Background(), empire.CertsAttachOpts{
+		App:  app,
+		Cert: cert,
+	})
 	assert.NoError(t, err)
 
 	app, err = e.AppsFind(empire.AppsQuery{ID: &app.ID})
 	assert.NoError(t, err)
-	assert.Equal(t, cert, app.Cert)
+	assert.Equal(t, empire.Certs{"web": "serverCertificate"}, app.Certs)
+
+	cert = "otherCertificate"
+	err = e.CertsAttach(context.Background(), empire.CertsAttachOpts{
+		App:     app,
+		Cert:    cert,
+		Process: "http",
+	})
+	assert.NoError(t, err)
+
+	app, err = e.AppsFind(empire.AppsQuery{ID: &app.ID})
+	assert.NoError(t, err)
+	assert.Equal(t, empire.Certs{"web": "serverCertificate", "http": "otherCertificate"}, app.Certs)
 
 	s.AssertExpectations(t)
 }
@@ -98,8 +89,8 @@ func TestEmpire_Deploy(t *testing.T) {
 	assert.NoError(t, err)
 
 	img := image.Image{Repository: "remind101/acme-inc"}
-	s.On("Submit", &scheduler.App{
-		ID:      app.ID,
+	s.On("Submit", &twelvefactor.Manifest{
+		AppID:   app.ID,
 		Name:    "acme-inc",
 		Release: "v1",
 		Env: map[string]string{
@@ -112,19 +103,20 @@ func TestEmpire_Deploy(t *testing.T) {
 			"empire.app.id":      app.ID,
 			"empire.app.release": "v1",
 		},
-		Processes: []*scheduler.Process{
+		Processes: []*twelvefactor.Process{
 			{
-				Type:        "scheduled",
-				Image:       img,
-				Command:     []string{"./bin/scheduled"},
-				Schedule:    scheduler.CRONSchedule("* * * * * *"),
-				Instances:   0,
-				MemoryLimit: 536870912,
-				CPUShares:   256,
-				Nproc:       256,
+				Type:      "scheduled",
+				Image:     img,
+				Command:   []string{"./bin/scheduled"},
+				Schedule:  twelvefactor.CRONSchedule("* * * * * *"),
+				Quantity:  0,
+				Memory:    536870912,
+				CPUShares: 256,
+				Nproc:     256,
 				Env: map[string]string{
-					"EMPIRE_PROCESS": "scheduled",
-					"SOURCE":         "acme-inc.scheduled.v1",
+					"EMPIRE_PROCESS":       "scheduled",
+					"EMPIRE_PROCESS_SCALE": "0",
+					"SOURCE":               "acme-inc.scheduled.v1",
 				},
 				Labels: map[string]string{
 					"empire.app.process": "scheduled",
@@ -134,32 +126,41 @@ func TestEmpire_Deploy(t *testing.T) {
 				Type:    "web",
 				Image:   img,
 				Command: []string{"./bin/web"},
-				Exposure: &scheduler.Exposure{
-					Type: &scheduler.HTTPExposure{},
+				Exposure: &twelvefactor.Exposure{
+					Ports: []twelvefactor.Port{
+						{
+							Container: 8080,
+							Host:      80,
+							Protocol:  &twelvefactor.HTTP{},
+						},
+					},
 				},
-				Instances:   1,
-				MemoryLimit: 536870912,
-				CPUShares:   256,
-				Nproc:       256,
+				Quantity:  1,
+				Memory:    536870912,
+				CPUShares: 256,
+				Nproc:     256,
 				Env: map[string]string{
-					"EMPIRE_PROCESS": "web",
-					"SOURCE":         "acme-inc.web.v1",
+					"EMPIRE_PROCESS":       "web",
+					"EMPIRE_PROCESS_SCALE": "1",
+					"SOURCE":               "acme-inc.web.v1",
+					"PORT":                 "8080",
 				},
 				Labels: map[string]string{
 					"empire.app.process": "web",
 				},
 			},
 			{
-				Type:        "worker",
-				Image:       img,
-				Command:     []string{"./bin/worker"},
-				Instances:   0,
-				MemoryLimit: 536870912,
-				CPUShares:   256,
-				Nproc:       256,
+				Type:      "worker",
+				Image:     img,
+				Command:   []string{"./bin/worker"},
+				Quantity:  0,
+				Memory:    536870912,
+				CPUShares: 256,
+				Nproc:     256,
 				Env: map[string]string{
-					"EMPIRE_PROCESS": "worker",
-					"SOURCE":         "acme-inc.worker.v1",
+					"EMPIRE_PROCESS":       "worker",
+					"EMPIRE_PROCESS_SCALE": "0",
+					"SOURCE":               "acme-inc.worker.v1",
 				},
 				Labels: map[string]string{
 					"empire.app.process": "worker",
@@ -183,9 +184,7 @@ func TestEmpire_Deploy_ImageNotFound(t *testing.T) {
 	e := empiretest.NewEmpire(t)
 	s := new(mockScheduler)
 	e.Scheduler = s
-	e.ProcfileExtractor = empire.ProcfileExtractorFunc(func(ctx context.Context, img image.Image, w io.Writer) ([]byte, error) {
-		return nil, errors.New("image not found")
-	})
+	e.ImageRegistry = empiretest.ExtractProcfile(nil, errors.New("image not found"))
 
 	// Deploying an image to an app that doesn't exist will create a new
 	// app.
@@ -201,72 +200,6 @@ func TestEmpire_Deploy_ImageNotFound(t *testing.T) {
 	apps, err := e.Apps(empire.AppsQuery{})
 	assert.NoError(t, err)
 	assert.Equal(t, 0, len(apps))
-
-	s.AssertExpectations(t)
-}
-
-func TestEmpire_Deploy_Concurrent(t *testing.T) {
-	e := empiretest.NewEmpire(t)
-	s := new(mockScheduler)
-	e.Scheduler = scheduler.NewFakeScheduler()
-	e.ProcfileExtractor = empiretest.ExtractProcfile(procfile.ExtendedProcfile{
-		"web": procfile.Process{
-			Command: []string{"./bin/web"},
-		},
-	})
-
-	user := &empire.User{Name: "ejholmes"}
-
-	// Create the first release for this app.
-	r, err := e.Deploy(context.Background(), empire.DeployOpts{
-		User:   user,
-		Output: empire.NewDeploymentStream(ioutil.Discard),
-		Image:  image.Image{Repository: "remind101/acme-inc"},
-	})
-	assert.NoError(t, err)
-	assert.Equal(t, 1, r.Version)
-
-	// We'll use the procfile extractor to synchronize two concurrent
-	// deployments.
-	v2Started, v3Started := make(chan struct{}), make(chan struct{})
-	e.ProcfileExtractor = empire.ProcfileExtractorFunc(func(ctx context.Context, img image.Image, w io.Writer) ([]byte, error) {
-		switch img.Tag {
-		case "v2":
-			close(v2Started)
-			<-v3Started
-		case "v3":
-			close(v3Started)
-		}
-		return procfile.Marshal(procfile.ExtendedProcfile{
-			"web": procfile.Process{
-				Command: []string{"./bin/web"},
-			},
-		})
-	})
-
-	v2Done := make(chan struct{})
-	go func() {
-		r, err := e.Deploy(context.Background(), empire.DeployOpts{
-			User:   user,
-			Output: empire.NewDeploymentStream(ioutil.Discard),
-			Image:  image.Image{Repository: "remind101/acme-inc", Tag: "v2"},
-		})
-		assert.NoError(t, err)
-		assert.Equal(t, 2, r.Version)
-		close(v2Done)
-	}()
-
-	<-v2Started
-
-	r, err = e.Deploy(context.Background(), empire.DeployOpts{
-		User:   user,
-		Output: empire.NewDeploymentStream(ioutil.Discard),
-		Image:  image.Image{Repository: "remind101/acme-inc", Tag: "v3"},
-	})
-	assert.NoError(t, err)
-	assert.Equal(t, 3, r.Version)
-
-	<-v2Done
 
 	s.AssertExpectations(t)
 }
@@ -294,8 +227,8 @@ func TestEmpire_Run(t *testing.T) {
 	s := new(mockScheduler)
 	e.Scheduler = s
 
-	s.On("Run", &scheduler.App{
-		ID:      app.ID,
+	s.On("Run", &twelvefactor.Manifest{
+		AppID:   app.ID,
 		Name:    "acme-inc",
 		Release: "v1",
 		Env: map[string]string{
@@ -308,25 +241,28 @@ func TestEmpire_Run(t *testing.T) {
 			"empire.app.id":      app.ID,
 			"empire.app.release": "v1",
 		},
-	},
-		&scheduler.Process{
-			Type:        "run",
-			Image:       img,
-			Command:     []string{"bundle", "exec", "rake", "db:migrate"},
-			Instances:   1,
-			MemoryLimit: 536870912,
-			CPUShares:   256,
-			Nproc:       256,
-			Env: map[string]string{
-				"EMPIRE_PROCESS": "run",
-				"SOURCE":         "acme-inc.run.v1",
-				"TERM":           "xterm",
+		Processes: []*twelvefactor.Process{
+			&twelvefactor.Process{
+				Type:      "run",
+				Image:     img,
+				Command:   []string{"bundle", "exec", "rake", "db:migrate"},
+				Quantity:  1,
+				Memory:    536870912,
+				CPUShares: 256,
+				Nproc:     256,
+				Env: map[string]string{
+					"EMPIRE_PROCESS":       "run",
+					"EMPIRE_PROCESS_SCALE": "1",
+					"SOURCE":               "acme-inc.run.v1",
+					"TERM":                 "xterm",
+				},
+				Labels: map[string]string{
+					"empire.app.process": "run",
+					"empire.user":        "ejholmes",
+				},
 			},
-			Labels: map[string]string{
-				"empire.app.process": "run",
-				"empire.user":        "ejholmes",
-			},
-		}, nil, nil).Return(nil)
+		},
+	}).Return(nil)
 
 	err = e.Run(context.Background(), empire.RunOpts{
 		User:    user,
@@ -334,8 +270,9 @@ func TestEmpire_Run(t *testing.T) {
 		Command: empire.MustParseCommand("bundle exec rake db:migrate"),
 
 		// Detached Process
-		Output: nil,
-		Input:  nil,
+		Stdin:  nil,
+		Stdout: nil,
+		Stderr: nil,
 
 		Env: map[string]string{
 			"TERM": "xterm",
@@ -369,8 +306,8 @@ func TestEmpire_Run_WithConstraints(t *testing.T) {
 	s := new(mockScheduler)
 	e.Scheduler = s
 
-	s.On("Run", &scheduler.App{
-		ID:      app.ID,
+	s.On("Run", &twelvefactor.Manifest{
+		AppID:   app.ID,
 		Name:    "acme-inc",
 		Release: "v1",
 		Env: map[string]string{
@@ -383,25 +320,28 @@ func TestEmpire_Run_WithConstraints(t *testing.T) {
 			"empire.app.id":      app.ID,
 			"empire.app.release": "v1",
 		},
-	},
-		&scheduler.Process{
-			Type:        "run",
-			Image:       img,
-			Command:     []string{"bundle", "exec", "rake", "db:migrate"},
-			Instances:   1,
-			MemoryLimit: 1073741824,
-			CPUShares:   512,
-			Nproc:       512,
-			Env: map[string]string{
-				"EMPIRE_PROCESS": "run",
-				"SOURCE":         "acme-inc.run.v1",
-				"TERM":           "xterm",
+		Processes: []*twelvefactor.Process{
+			&twelvefactor.Process{
+				Type:      "run",
+				Image:     img,
+				Command:   []string{"bundle", "exec", "rake", "db:migrate"},
+				Quantity:  1,
+				Memory:    1073741824,
+				CPUShares: 512,
+				Nproc:     512,
+				Env: map[string]string{
+					"EMPIRE_PROCESS":       "run",
+					"EMPIRE_PROCESS_SCALE": "1",
+					"SOURCE":               "acme-inc.run.v1",
+					"TERM":                 "xterm",
+				},
+				Labels: map[string]string{
+					"empire.app.process": "run",
+					"empire.user":        "ejholmes",
+				},
 			},
-			Labels: map[string]string{
-				"empire.app.process": "run",
-				"empire.user":        "ejholmes",
-			},
-		}, nil, nil).Return(nil)
+		},
+	}).Return(nil)
 
 	constraints := empire.NamedConstraints["2X"]
 	err = e.Run(context.Background(), empire.RunOpts{
@@ -410,8 +350,9 @@ func TestEmpire_Run_WithConstraints(t *testing.T) {
 		Command: empire.MustParseCommand("bundle exec rake db:migrate"),
 
 		// Detached Process
-		Output: nil,
-		Input:  nil,
+		Stdin:  nil,
+		Stdout: nil,
+		Stderr: nil,
 
 		Env: map[string]string{
 			"TERM": "xterm",
@@ -424,15 +365,120 @@ func TestEmpire_Run_WithConstraints(t *testing.T) {
 	s.AssertExpectations(t)
 }
 
+func TestEmpire_Run_WithAllowCommandProcfile(t *testing.T) {
+	e := empiretest.NewEmpire(t)
+	e.AllowedCommands = empire.AllowCommandProcfile
+
+	user := &empire.User{Name: "ejholmes"}
+
+	app, err := e.Create(context.Background(), empire.CreateOpts{
+		User: user,
+		Name: "acme-inc",
+	})
+	assert.NoError(t, err)
+
+	img := image.Image{Repository: "remind101/acme-inc"}
+	_, err = e.Deploy(context.Background(), empire.DeployOpts{
+		App:    app,
+		User:   user,
+		Output: empire.NewDeploymentStream(ioutil.Discard),
+		Image:  img,
+	})
+	assert.NoError(t, err)
+
+	s := new(mockScheduler)
+	e.Scheduler = s
+
+	err = e.Run(context.Background(), empire.RunOpts{
+		User:    user,
+		App:     app,
+		Command: empire.MustParseCommand("bundle exec rake db:migrate"),
+
+		// Detached Process
+		Stdin:  nil,
+		Stdout: nil,
+		Stderr: nil,
+
+		Env: map[string]string{
+			"TERM": "xterm",
+		},
+	})
+	assert.IsType(t, &empire.CommandNotAllowedError{}, err)
+
+	s.On("Run", &twelvefactor.Manifest{
+		AppID:   app.ID,
+		Name:    "acme-inc",
+		Release: "v1",
+		Env: map[string]string{
+			"EMPIRE_APPID":   app.ID,
+			"EMPIRE_APPNAME": "acme-inc",
+			"EMPIRE_RELEASE": "v1",
+		},
+		Labels: map[string]string{
+			"empire.app.id":      app.ID,
+			"empire.app.name":    "acme-inc",
+			"empire.app.release": "v1",
+		},
+		Processes: []*twelvefactor.Process{
+			&twelvefactor.Process{
+				Type:      "rake",
+				Image:     img,
+				Command:   []string{"bundle", "exec", "rake", "db:migrate"},
+				Quantity:  1,
+				Memory:    536870912,
+				CPUShares: 256,
+				Nproc:     256,
+				Env: map[string]string{
+					"EMPIRE_PROCESS":       "rake",
+					"EMPIRE_PROCESS_SCALE": "1",
+					"SOURCE":               "acme-inc.rake.v1",
+					"TERM":                 "xterm",
+				},
+				Labels: map[string]string{
+					"empire.app.process": "rake",
+					"empire.user":        "ejholmes",
+				},
+				ECS: &procfile.ECS{
+					PlacementConstraints: []*ecs.PlacementConstraint{
+						&ecs.PlacementConstraint{
+							Type:       aws.String("memberOf"),
+							Expression: aws.String("attribute:profile = background"),
+						},
+					},
+					PlacementStrategy: []*ecs.PlacementStrategy{},
+				},
+			},
+		},
+	}).Return(nil)
+
+	err = e.Run(context.Background(), empire.RunOpts{
+		User:    user,
+		App:     app,
+		Command: empire.MustParseCommand("rake db:migrate"),
+
+		// Detached Process
+		Stdin:  nil,
+		Stdout: nil,
+		Stderr: nil,
+
+		Env: map[string]string{
+			"TERM": "xterm",
+		},
+	})
+	assert.NoError(t, err)
+
+	s.AssertExpectations(t)
+}
+
 func TestEmpire_Set(t *testing.T) {
 	e := empiretest.NewEmpire(t)
 	s := new(mockScheduler)
 	e.Scheduler = s
-	e.ProcfileExtractor = empiretest.ExtractProcfile(procfile.ExtendedProcfile{
+	e.ImageRegistry = empiretest.ExtractProcfile(procfile.ExtendedProcfile{
 		"web": procfile.Process{
 			Command: []string{"./bin/web"},
 		},
-	})
+	}, nil)
 
 	user := &empire.User{Name: "ejholmes"}
 
@@ -456,8 +502,8 @@ func TestEmpire_Set(t *testing.T) {
 
 	// Deploy a new image to the app.
 	img := image.Image{Repository: "remind101/acme-inc"}
-	s.On("Submit", &scheduler.App{
-		ID:      app.ID,
+	s.On("Submit", &twelvefactor.Manifest{
+		AppID:   app.ID,
 		Name:    "acme-inc",
 		Release: "v1",
 		Env: map[string]string{
@@ -471,21 +517,29 @@ func TestEmpire_Set(t *testing.T) {
 			"empire.app.id":      app.ID,
 			"empire.app.release": "v1",
 		},
-		Processes: []*scheduler.Process{
+		Processes: []*twelvefactor.Process{
 			{
 				Type:    "web",
 				Image:   img,
 				Command: []string{"./bin/web"},
-				Exposure: &scheduler.Exposure{
-					Type: &scheduler.HTTPExposure{},
+				Exposure: &twelvefactor.Exposure{
+					Ports: []twelvefactor.Port{
+						{
+							Container: 8080,
+							Host:      80,
+							Protocol:  &twelvefactor.HTTP{},
+						},
+					},
 				},
-				Instances:   1,
-				MemoryLimit: 536870912,
-				CPUShares:   256,
-				Nproc:       256,
+				Quantity:  1,
+				Memory:    536870912,
+				CPUShares: 256,
+				Nproc:     256,
 				Env: map[string]string{
-					"EMPIRE_PROCESS": "web",
-					"SOURCE":         "acme-inc.web.v1",
+					"EMPIRE_PROCESS":       "web",
+					"EMPIRE_PROCESS_SCALE": "1",
+					"SOURCE":               "acme-inc.web.v1",
+					"PORT":                 "8080",
 				},
 				Labels: map[string]string{
 					"empire.app.process": "web",
@@ -503,8 +557,8 @@ func TestEmpire_Set(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Remove the environment variable
-	s.On("Submit", &scheduler.App{
-		ID:      app.ID,
+	s.On("Submit", &twelvefactor.Manifest{
+		AppID:   app.ID,
 		Name:    "acme-inc",
 		Release: "v2",
 		Env: map[string]string{
@@ -517,21 +571,29 @@ func TestEmpire_Set(t *testing.T) {
 			"empire.app.id":      app.ID,
 			"empire.app.release": "v2",
 		},
-		Processes: []*scheduler.Process{
+		Processes: []*twelvefactor.Process{
 			{
 				Type:    "web",
 				Image:   img,
 				Command: []string{"./bin/web"},
-				Exposure: &scheduler.Exposure{
-					Type: &scheduler.HTTPExposure{},
+				Exposure: &twelvefactor.Exposure{
+					Ports: []twelvefactor.Port{
+						{
+							Container: 8080,
+							Host:      80,
+							Protocol:  &twelvefactor.HTTP{},
+						},
+					},
 				},
-				Instances:   1,
-				MemoryLimit: 536870912,
-				CPUShares:   256,
-				Nproc:       256,
+				Quantity:  1,
+				Memory:    536870912,
+				CPUShares: 256,
+				Nproc:     256,
 				Env: map[string]string{
-					"EMPIRE_PROCESS": "web",
-					"SOURCE":         "acme-inc.web.v2",
+					"EMPIRE_PROCESS":       "web",
+					"EMPIRE_PROCESS_SCALE": "1",
+					"SOURCE":               "acme-inc.web.v2",
+					"PORT":                 "8080",
 				},
 				Labels: map[string]string{
 					"empire.app.process": "web",
@@ -553,17 +615,17 @@ func TestEmpire_Set(t *testing.T) {
 }
 
 type mockScheduler struct {
-	scheduler.Scheduler
+	empire.Scheduler
 	mock.Mock
 }
 
-type processesByType []*scheduler.Process
+type processesByType []*twelvefactor.Process
 
 func (e processesByType) Len() int           { return len(e) }
 func (e processesByType) Less(i, j int) bool { return e[i].Type < e[j].Type }
 func (e processesByType) Swap(i, j int)      { e[i], e[j] = e[j], e[i] }
 
-func (m *mockScheduler) Submit(_ context.Context, app *scheduler.App, ss scheduler.StatusStream) error {
+func (m *mockScheduler) Submit(_ context.Context, app *twelvefactor.Manifest, ss twelvefactor.StatusStream) error {
 	// mock.Mock checks the order of slices, so sort by process name.
 	p := processesByType(app.Processes)
 	sort.Sort(p)
@@ -573,8 +635,7 @@ func (m *mockScheduler) Submit(_ context.Context, app *scheduler.App, ss schedul
 	return args.Error(0)
 }
 
-func (m *mockScheduler) Run(_ context.Context, app *scheduler.App, process *scheduler.Process, in io.Reader, out io.Writer) error {
-	app.Processes = nil // This is bogus and doesn't actually matter for Runs.
-	args := m.Called(app, process, in, out)
+func (m *mockScheduler) Run(_ context.Context, app *twelvefactor.Manifest) error {
+	args := m.Called(app)
 	return args.Error(0)
 }

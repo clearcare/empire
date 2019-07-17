@@ -1,16 +1,13 @@
 package heroku
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
-
-	"golang.org/x/net/context"
 
 	"github.com/jinzhu/gorm"
 	"github.com/remind101/empire"
 	"github.com/remind101/empire/pkg/heroku"
-	"github.com/remind101/empire/server/auth"
-	"github.com/remind101/pkg/httpx"
 )
 
 // Named matching heroku's error codes. See
@@ -94,17 +91,38 @@ func errNotImplemented(message string) *ErrorResource {
 	}
 }
 
-func errUnauthorized(err *auth.UnauthorizedError) *ErrorResource {
+// Returns an appropriate ErrorResource when a request is unauthorized.
+func Unauthorized(reason error) *ErrorResource {
+	if reason == nil {
+		return ErrUnauthorized
+	}
+
 	return &ErrorResource{
 		Status:  http.StatusUnauthorized,
 		ID:      "unauthorized",
-		Message: err.Reason,
+		Message: reason.Error(),
 	}
 }
 
-// errHandler returns an httpx.Handler that responds with the given error.
-func errHandler(err error) httpx.Handler {
-	return httpx.HandlerFunc(func(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
+// SAMLUnauthorized can be used in place of Unauthorized to return a link to
+// login via SAML.
+func SAMLUnauthorized(loginURL string) func(error) *ErrorResource {
+	return func(reason error) *ErrorResource {
+		if reason == nil {
+			reason = errors.New("Request not authenticated, API token is missing, invalid or expired")
+		}
+
+		return &ErrorResource{
+			Status:  http.StatusUnauthorized,
+			ID:      "saml_unauthorized",
+			Message: fmt.Sprintf("%s. Login at %s", reason, loginURL),
+		}
+	}
+}
+
+// errHandler returns a handler that responds with the given error.
+func errHandler(err error) handlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) error {
 		return err
-	})
+	}
 }

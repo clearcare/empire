@@ -3,8 +3,8 @@
 package cloudformation
 
 import (
-	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -12,8 +12,8 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws/client"
 	"github.com/aws/aws-sdk-go/service/sqs"
+	"github.com/remind101/empire"
 	"github.com/remind101/empire/pkg/cloudformation/customresources"
-	"github.com/remind101/empire/scheduler/ecs/lb"
 	"github.com/remind101/empire/stats"
 	"github.com/remind101/pkg/logger"
 )
@@ -47,21 +47,22 @@ type CustomResourceProvisioner struct {
 
 // NewCustomResourceProvisioner returns a new CustomResourceProvisioner with an
 // sqs client configured from config.
-func NewCustomResourceProvisioner(db *sql.DB, config client.ConfigProvider) *CustomResourceProvisioner {
+func NewCustomResourceProvisioner(empire *empire.Empire, config client.ConfigProvider) *CustomResourceProvisioner {
+	db := empire.DB.DB.DB()
 	p := &CustomResourceProvisioner{
 		SQSDispatcher: newSQSDispatcher(config),
 		Provisioners:  make(map[string]customresources.Provisioner),
 		sendResponse:  customresources.SendResponse,
 	}
 
-	p.add("Custom::InstancePort", &InstancePortsProvisioner{
-		ports: lb.NewDBPortAllocator(db),
-	})
+	p.add("Custom::InstancePort", newInstancePortsProvisioner(&InstancePortsResource{
+		ports: newDBPortAllocator(db),
+	}))
 
 	ecs := newECSClient(config)
-	p.add("Custom::ECSService", &ECSServiceResource{
+	p.add("Custom::ECSService", newECSServiceProvisioner(&ECSServiceResource{
 		ecs: ecs,
-	})
+	}))
 
 	store := &dbEnvironmentStore{db}
 	p.add("Custom::ECSEnvironment", newECSEnvironmentProvisioner(&ECSEnvironmentResource{
@@ -71,6 +72,13 @@ func NewCustomResourceProvisioner(db *sql.DB, config client.ConfigProvider) *Cus
 		ecs:              ecs,
 		environmentStore: store,
 	}))
+
+	p.add("Custom::EmpireApp", &EmpireAppResource{
+		empire: empire,
+	})
+	p.add("Custom::EmpireAppEnvironment", &EmpireAppEnvironmentResource{
+		empire: empire,
+	})
 
 	return p
 }
@@ -192,6 +200,9 @@ type provisioner struct {
 }
 
 func (p *provisioner) Properties() interface{} {
+	if p.properties == nil {
+		return nil
+	}
 	return p.properties()
 }
 
@@ -216,6 +227,9 @@ func (p *provisioner) Provision(ctx context.Context, req customresources.Request
 		}
 
 		id := req.PhysicalResourceId
+		if p.Update == nil {
+			return id, nil, errors.New("resource does not support updates")
+		}
 		data, err := p.Update(ctx, req)
 		return id, data, err
 	case customresources.Delete:
@@ -239,6 +253,12 @@ func requiresReplacement(n, o properties) (bool, error) {
 	}
 
 	return a != b, nil
+}
+
+// newUser returns an empire.User that should be used by resources when making
+// requests to empire.
+func newUser() *empire.User {
+	return &empire.User{Name: "CloudFormation"}
 }
 
 type metricsProvisioner struct {

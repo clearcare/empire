@@ -7,7 +7,7 @@ A CLI for Empire.
 You can always download the latest version with:
 
 ```console
-$ curl -L https://github.com/remind101/empire/releases/download/v0.10.1/emp-`uname -s`-`uname -m` \
+$ curl -L https://github.com/remind101/empire/releases/download/v0.13.0/emp-`uname -s`-`uname -m` \
   > /usr/local/bin/emp
 ```
 
@@ -21,7 +21,6 @@ $ brew install emp
 If you have a working Go 1.5+ environment, you can do the following:
 
 ```console
-$ export GO15VENDOREXPERIMENT=1 # Required for Go 1.5.x
 $ go get -u github.com/remind101/empire/cmd/emp
 ```
 

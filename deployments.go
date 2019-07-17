@@ -1,13 +1,12 @@
 package empire
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 
-	"github.com/docker/docker/pkg/jsonmessage"
 	"github.com/jinzhu/gorm"
-	"github.com/remind101/empire/scheduler"
+	"github.com/remind101/empire/pkg/jsonmessage"
+	"github.com/remind101/empire/twelvefactor"
 	"golang.org/x/net/context"
 )
 
@@ -18,7 +17,7 @@ type deployerService struct {
 }
 
 // createRelease creates a new release that can be deployed
-func (s *deployerService) createRelease(ctx context.Context, db *gorm.DB, ss scheduler.StatusStream, opts DeployOpts) (*Release, error) {
+func (s *deployerService) createRelease(ctx context.Context, db *gorm.DB, ss twelvefactor.StatusStream, opts DeployOpts) (*Release, error) {
 	app, img := opts.App, opts.Image
 
 	// If no app is specified, attempt to find the app that relates to this
@@ -63,7 +62,7 @@ func (s *deployerService) createRelease(ctx context.Context, db *gorm.DB, ss sch
 	return r, err
 }
 
-func (s *deployerService) createInTransaction(ctx context.Context, stream scheduler.StatusStream, opts DeployOpts) (*Release, error) {
+func (s *deployerService) createInTransaction(ctx context.Context, stream twelvefactor.StatusStream, opts DeployOpts) (*Release, error) {
 	tx := s.db.Begin()
 	r, err := s.createRelease(ctx, tx, stream, opts)
 	if err != nil {
@@ -78,7 +77,7 @@ func (s *deployerService) createInTransaction(ctx context.Context, stream schedu
 func (s *deployerService) Deploy(ctx context.Context, opts DeployOpts) (*Release, error) {
 	w := opts.Output
 
-	var stream scheduler.StatusStream
+	var stream twelvefactor.StatusStream
 	if opts.Stream {
 		stream = w
 	}
@@ -102,55 +101,30 @@ func (s *deployerService) Deploy(ctx context.Context, opts DeployOpts) (*Release
 // DeploymentStream provides a wrapper around an io.Writer for writing
 // jsonmessage statuses, and implements the scheduler.StatusStream interface.
 type DeploymentStream struct {
-	w   io.Writer
-	enc *json.Encoder
+	*jsonmessage.Stream
 }
 
 // NewDeploymentStream wraps the io.Writer as a DeploymentStream.
 func NewDeploymentStream(w io.Writer) *DeploymentStream {
-	return &DeploymentStream{
-		w:   w,
-		enc: json.NewEncoder(w),
-	}
-}
-
-// Write implements the io.Writer interface. This allows things like the Docker
-// daemon to write directly to the io.Writer, since it already writes in
-// jsonmessage format.
-func (w *DeploymentStream) Write(b []byte) (int, error) {
-	return w.w.Write(b)
+	return &DeploymentStream{jsonmessage.NewStream(w)}
 }
 
 // Publish implements the scheduler.StatusStream interface.
-func (w *DeploymentStream) Publish(status scheduler.Status) error {
+func (w *DeploymentStream) Publish(status twelvefactor.Status) error {
 	return w.Status(status.Message)
 }
 
 // Status writes a simple status update to the jsonmessage stream.
 func (w *DeploymentStream) Status(message string) error {
 	m := jsonmessage.JSONMessage{Status: fmt.Sprintf("Status: %s", message)}
-	return w.encode(m)
+	return w.Encode(m)
 }
 
 // Error writes the error to the jsonmessage stream. The error that is provided
 // is also returned, so that Error() can be used in return values.
 func (w *DeploymentStream) Error(err error) error {
-	if encErr := w.encode(newJSONMessageError(err)); encErr != nil {
+	if encErr := w.Encode(jsonmessage.NewError(err)); encErr != nil {
 		return encErr
 	}
 	return err
-}
-
-// encode encodes m into the stream.
-func (w *DeploymentStream) encode(m jsonmessage.JSONMessage) error {
-	return w.enc.Encode(m)
-}
-
-func newJSONMessageError(err error) jsonmessage.JSONMessage {
-	return jsonmessage.JSONMessage{
-		ErrorMessage: err.Error(),
-		Error: &jsonmessage.JSONError{
-			Message: err.Error(),
-		},
-	}
 }

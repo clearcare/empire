@@ -1,10 +1,21 @@
 package empire
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 )
+
+func TestMultiEventStream(t *testing.T) {
+	boom := errors.New("boom")
+	s := MultiEventStream{EventStreamFunc(func(event Event) error {
+		return boom
+	})}
+	err := s.PublishEvent(RunEvent{User: "ejholmes", App: "acme-inc", Command: []string{"bash"}})
+	assert.EqualError(t, err, "1 error(s) occurred:\n\n* boom")
+
+}
 
 func TestEvents_String(t *testing.T) {
 	tests := []struct {
@@ -25,6 +36,11 @@ func TestEvents_String(t *testing.T) {
 		{RestartEvent{User: "ejholmes", App: "acme-inc", PID: "abcd"}, "ejholmes restarted `abcd` on acme-inc"},
 		{RestartEvent{User: "ejholmes", App: "acme-inc", Message: "commit message"}, "ejholmes restarted acme-inc: 'commit message'"},
 		{RestartEvent{User: "ejholmes", App: "acme-inc", PID: "abcd", Message: "commit message"}, "ejholmes restarted `abcd` on acme-inc: 'commit message'"},
+
+		// MaintenanceEvent
+		{MaintenanceEvent{User: "ejholmes", App: "acme-inc", Maintenance: false}, "ejholmes disabled maintenance mode on acme-inc"},
+		{MaintenanceEvent{User: "ejholmes", App: "acme-inc", Maintenance: true}, "ejholmes enabled maintenance mode on acme-inc"},
+		{MaintenanceEvent{User: "ejholmes", App: "acme-inc", Maintenance: true, Message: "upgrading db"}, "ejholmes enabled maintenance mode on acme-inc: 'upgrading db'"},
 
 		// ScaleEvent
 		{ScaleEvent{

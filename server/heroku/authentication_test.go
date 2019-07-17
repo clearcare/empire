@@ -1,97 +1,135 @@
 package heroku
 
 import (
+	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/remind101/empire"
 	"github.com/remind101/empire/server/auth"
-	"github.com/remind101/pkg/httpx"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"golang.org/x/net/context"
 )
 
-func TestAuthentication_UsernamePassword(t *testing.T) {
-	a := new(mockAuthenticator)
-	m := &Authentication{
-		authenticator: a,
-		handler:       ensureUserInContext(t),
-	}
+var testSecret = []byte("secret")
+var ctx = context.Background()
 
-	ctx := context.Background()
-	resp := httptest.NewRecorder()
+func TestServer_AccessTokens(t *testing.T) {
+	s := &Server{Secret: testSecret}
+
+	token := &AccessToken{
+		User: &empire.User{Name: "ejholmes"},
+	}
+	_, err := s.AccessTokensCreate(token)
+	assert.NoError(t, err)
+
+	token, err = s.AccessTokensFind(token.Token)
+	assert.NoError(t, err)
+	assert.NotNil(t, token)
+	assert.Equal(t, "ejholmes", token.User.Name)
+
+	token, err = s.AccessTokensFind("invalid")
+	assert.NoError(t, err)
+	assert.Nil(t, token)
+
+	token = &AccessToken{
+		User: &empire.User{Name: ""},
+	}
+	_, err = s.AccessTokensCreate(token)
+	assert.Equal(t, empire.ErrUserName, err)
+}
+
+func TestServer_Authenticate_UsernamePassword(t *testing.T) {
+	a := new(mockAuthenticator)
+	m := &Server{Auth: newAuth(a)}
+
+	req, _ := http.NewRequest("GET", "/", nil)
+	req.SetBasicAuth("username", "password")
+
+	a.On("Authenticate", "username", "password", "").Return(auth.NewSession(&empire.User{}), nil)
+
+	_, err := m.Authenticate(req.WithContext(ctx))
+	assert.NoError(t, err)
+}
+
+func TestServer_Authenticate_WithUnknownStrategy(t *testing.T) {
+	a := new(mockAuthenticator)
+	m := &Server{Auth: newAuth(a)}
+
 	req, _ := http.NewRequest("GET", "/", nil)
 	req.SetBasicAuth("username", "password")
 
 	a.On("Authenticate", "username", "password", "").Return(&empire.User{}, nil)
 
-	err := m.ServeHTTPContext(ctx, resp, req)
-	assert.NoError(t, err)
+	assert.Panics(t, func() {
+		m.Authenticate(req.WithContext(ctx), "mock")
+	}, "Calling Authenticate with an unknown strategy should panic")
 }
 
-func TestAuthentication_UsernamePasswordWithOTP(t *testing.T) {
+func TestServer_Authenticate_WithStrategy(t *testing.T) {
 	a := new(mockAuthenticator)
-	m := &Authentication{
-		authenticator: a,
-		handler:       ensureUserInContext(t),
-	}
+	m := &Server{Auth: newAuth(a)}
 
-	ctx := context.Background()
-	resp := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/", nil)
+	req.SetBasicAuth("username", "password")
+
+	a.On("Authenticate", "username", "password", "").Return(auth.NewSession(&empire.User{}), nil)
+
+	_, err := m.Authenticate(req.WithContext(ctx))
+	assert.NoError(t, err)
+
+	// The provided credentials aren't an access token, so this should
+	// return ErrUnauthorized.
+	_, err = m.Authenticate(req.WithContext(ctx), auth.StrategyAccessToken)
+	assert.Equal(t, ErrUnauthorized, err)
+}
+
+func TestServer_Authenticate_UsernamePasswordWithOTP(t *testing.T) {
+	a := new(mockAuthenticator)
+	m := &Server{Auth: newAuth(a)}
+
 	req, _ := http.NewRequest("GET", "/", nil)
 	req.SetBasicAuth("username", "password")
 	req.Header.Set("Heroku-Two-Factor-Code", "otp")
 
-	a.On("Authenticate", "username", "password", "otp").Return(&empire.User{}, nil)
+	a.On("Authenticate", "username", "password", "otp").Return(auth.NewSession(&empire.User{}), nil)
 
-	err := m.ServeHTTPContext(ctx, resp, req)
+	_, err := m.Authenticate(req.WithContext(ctx))
 	assert.NoError(t, err)
 }
 
-func TestAuthentication_ErrTwoFactor(t *testing.T) {
+func TestServer_Authenticate_ErrTwoFactor(t *testing.T) {
 	a := new(mockAuthenticator)
-	m := &Authentication{
-		authenticator: a,
-	}
+	m := &Server{Auth: newAuth(a)}
 
-	ctx := context.Background()
-	resp := httptest.NewRecorder()
 	req, _ := http.NewRequest("GET", "/", nil)
 	req.SetBasicAuth("username", "password")
 
 	a.On("Authenticate", "username", "password", "").Return(nil, auth.ErrTwoFactor)
 
-	err := m.ServeHTTPContext(ctx, resp, req)
+	_, err := m.Authenticate(req.WithContext(ctx))
 	assert.Equal(t, ErrTwoFactor, err)
 }
 
-func TestAuthentication_ErrForbidden(t *testing.T) {
+func TestServer_Authenticate_ErrForbidden(t *testing.T) {
 	a := new(mockAuthenticator)
-	m := &Authentication{
-		authenticator: a,
-	}
+	m := &Server{Auth: newAuth(a)}
 
-	ctx := context.Background()
-	resp := httptest.NewRecorder()
 	req, _ := http.NewRequest("GET", "/", nil)
 	req.SetBasicAuth("username", "password")
 
 	a.On("Authenticate", "username", "password", "").Return(nil, auth.ErrForbidden)
 
-	err := m.ServeHTTPContext(ctx, resp, req)
+	_, err := m.Authenticate(req.WithContext(ctx))
 	assert.Equal(t, ErrUnauthorized, err) // TODO: ErrForbidden?
 }
 
-func TestAuthentication_UnauthorizedError(t *testing.T) {
+func TestServer_Authenticate_UnauthorizedError(t *testing.T) {
 	a := new(mockAuthenticator)
-	m := &Authentication{
-		authenticator: a,
-	}
+	m := &Server{Auth: newAuth(a)}
 
-	ctx := context.Background()
-	resp := httptest.NewRecorder()
 	req, _ := http.NewRequest("GET", "/", nil)
 	req.SetBasicAuth("username", "password")
 
@@ -99,7 +137,7 @@ func TestAuthentication_UnauthorizedError(t *testing.T) {
 		Reason: "Because you smell",
 	})
 
-	err := m.ServeHTTPContext(ctx, resp, req)
+	_, err := m.Authenticate(req.WithContext(ctx))
 	assert.Equal(t, &ErrorResource{
 		Status:  http.StatusUnauthorized,
 		ID:      "unauthorized",
@@ -107,25 +145,127 @@ func TestAuthentication_UnauthorizedError(t *testing.T) {
 	}, err)
 }
 
+func TestAccessTokenAuthenticator(t *testing.T) {
+	u := &empire.User{}
+	a := &accessTokenAuthenticator{
+		findAccessToken: func(token string) (*AccessToken, error) {
+			assert.Equal(t, "token", token)
+			return &AccessToken{
+				User: u,
+			}, nil
+		},
+	}
+
+	s := auth.NewSession(u)
+	session, err := a.Authenticate("", "token", "")
+	assert.NoError(t, err)
+	assert.Equal(t, s, session)
+}
+
+func TestAccessTokenAuthenticator_TokenNotFound(t *testing.T) {
+	a := &accessTokenAuthenticator{
+		findAccessToken: func(token string) (*AccessToken, error) {
+			assert.Equal(t, "token", token)
+			return nil, nil
+		},
+	}
+
+	session, err := a.Authenticate("", "token", "")
+	assert.Equal(t, auth.ErrForbidden, err)
+	assert.Nil(t, session)
+}
+
+func TestAccessTokenAuthenticator_WithExpiresAt(t *testing.T) {
+	exp := time.Now().Add(24 * time.Hour)
+
+	u := &empire.User{}
+	a := &accessTokenAuthenticator{
+		findAccessToken: func(token string) (*AccessToken, error) {
+			assert.Equal(t, "token", token)
+			return &AccessToken{
+				User:      u,
+				ExpiresAt: &exp,
+			}, nil
+		},
+	}
+
+	s := auth.NewSession(u)
+	s.ExpiresAt = &exp
+	session, err := a.Authenticate("", "token", "")
+	assert.NoError(t, err)
+	assert.Equal(t, s, session)
+}
+
+func TestAccessTokensFind(t *testing.T) {
+	s := &Server{Secret: testSecret}
+
+	at, err := s.AccessTokensFind("")
+	assert.NoError(t, err)
+	assert.Nil(t, at)
+}
+
+var tokenTests = []struct {
+	token *AccessToken
+	jwt   string
+}{
+	{
+		&AccessToken{
+			User: &empire.User{
+				Name: "ejholmes",
+			},
+		},
+		"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJVc2VyIjp7Ik5hbWUiOiJlamhvbG1lcyIsIkdpdEh1YlRva2VuIjoiIn19.vG51_ah6HX2c9lsOcbC8hdl-xtqDIy_eJQ7ga6CQIEQ",
+	},
+
+	{
+		&AccessToken{
+			User: &empire.User{
+				Name: "ejholmes",
+			},
+			ExpiresAt: func() *time.Time {
+				t := time.Date(2059, time.November, 10, 23, 0, 0, 0, time.UTC)
+				return &t
+			}(),
+		},
+		"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJVc2VyIjp7Ik5hbWUiOiJlamhvbG1lcyIsIkdpdEh1YlRva2VuIjoiIn0sImV4cCI6MjgzNTczMDgwMH0.k0Z1_5wVdI5AMInj5-fl_Xm_K5WVmRuPDblu-bqJ1p8",
+	},
+}
+
+func TestJWTTokens(t *testing.T) {
+	for i, tt := range tokenTests {
+		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
+			jwt, err := signToken(testSecret, tt.token)
+			assert.NoError(t, err)
+			assert.Equal(t, tt.jwt, jwt)
+
+			token, err := parseToken(testSecret, jwt)
+			assert.NoError(t, err)
+			assert.Equal(t, tt.token, token)
+		})
+	}
+}
+
 type mockAuthenticator struct {
 	mock.Mock
 }
 
-func (m *mockAuthenticator) Authenticate(username, password, otp string) (*empire.User, error) {
+func (m *mockAuthenticator) Authenticate(username, password, otp string) (*auth.Session, error) {
 	args := m.Called(username, password, otp)
-	user := args.Get(0)
-	if user != nil {
-		return user.(*empire.User), args.Error(1)
+	session := args.Get(0)
+	if session != nil {
+		return session.(*auth.Session), args.Error(1)
 	}
 	return nil, args.Error(1)
 
 }
 
-// ensureUserInContext returns and httpx.Handler that raises an error if the
-// user isn't set in the context.
-func ensureUserInContext(t testing.TB) httpx.Handler {
-	return httpx.HandlerFunc(func(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
-		UserFromContext(ctx) // Panics if user is not set.
-		return nil
-	})
+func newAuth(a *mockAuthenticator) *auth.Auth {
+	return &auth.Auth{
+		Strategies: auth.Strategies{
+			{
+				Name:          auth.StrategyUsernamePassword,
+				Authenticator: a,
+			},
+		},
+	}
 }

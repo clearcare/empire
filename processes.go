@@ -4,10 +4,12 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 
-	shellwords "github.com/mattn/go-shellwords"
+	"github.com/remind101/empire/internal/shellwords"
 	"github.com/remind101/empire/pkg/constraints"
+	"github.com/remind101/empire/procfile"
 )
 
 // DefaultQuantities maps a process type to the default number of instances to
@@ -70,6 +72,10 @@ type Process struct {
 	// Command is the command to run.
 	Command Command `json:"Command,omitempty"`
 
+	// Signifies that this is a named one off command and not a long lived
+	// service.
+	NoService bool `json:"Run,omitempty"`
+
 	// Quantity is the desired number of instances of this process.
 	Quantity int `json:"Quantity,omitempty"`
 
@@ -85,6 +91,33 @@ type Process struct {
 	// A cron expression. If provided, the process will be run as a
 	// scheduled task.
 	Cron *string `json:"cron,omitempty"`
+
+	// Port mappings from container to load balancer.
+	Ports []Port `json:"Ports,omitempty"`
+
+	// An process specific environment variables.
+	Environment map[string]string `json:"Environment,omitempty"`
+
+	// ECS specific parameters.
+	ECS *procfile.ECS `json:"ECS,omitempty"`
+}
+
+type Port struct {
+	Host      int    `json:"Host"`
+	Container int    `json:"Container"`
+	Protocol  string `json:"Protocol"`
+}
+
+// IsValid returns nil if the Process is valid.
+func (p *Process) IsValid() error {
+	// Ensure that processes marked as NoService can't be scaled up.
+	if p.NoService {
+		if p.Quantity != 0 {
+			return errors.New("non-service processes cannot be scaled up")
+		}
+	}
+
+	return nil
 }
 
 // Constraints returns a constraints.Constraints from this Process definition.
@@ -106,6 +139,17 @@ func (p *Process) SetConstraints(c Constraints) {
 
 // Formation represents a collection of named processes and their configuration.
 type Formation map[string]Process
+
+// IsValid returns nil if all of the Processes are valid.
+func (f Formation) IsValid() error {
+	for n, p := range f {
+		if err := p.IsValid(); err != nil {
+			return fmt.Errorf("process %s is not valid: %v", n, err)
+		}
+	}
+
+	return nil
+}
 
 // Scan implements the sql.Scanner interface.
 func (f *Formation) Scan(src interface{}) error {

@@ -6,8 +6,9 @@ import (
 
 	"github.com/jinzhu/gorm"
 	"github.com/remind101/empire/pkg/headerutil"
-	"github.com/remind101/empire/scheduler"
-	"github.com/remind101/pkg/timex"
+	"github.com/remind101/empire/pkg/timex"
+	"github.com/remind101/empire/procfile"
+	"github.com/remind101/empire/twelvefactor"
 	"golang.org/x/net/context"
 )
 
@@ -49,6 +50,11 @@ type Release struct {
 
 	// The time that this release was created.
 	CreatedAt *time.Time
+}
+
+// Procfile returns the Procfile that generated this Release.
+func (r *Release) Procfile() (procfile.Procfile, error) {
+	return r.Slug.ParsedProcfile()
 }
 
 // BeforeCreate sets created_at before inserting.
@@ -104,7 +110,7 @@ type releasesService struct {
 }
 
 // CreateAndRelease creates a new release then submits it to the scheduler.
-func (s *releasesService) CreateAndRelease(ctx context.Context, db *gorm.DB, r *Release, ss scheduler.StatusStream) (*Release, error) {
+func (s *releasesService) CreateAndRelease(ctx context.Context, db *gorm.DB, r *Release, ss twelvefactor.StatusStream) (*Release, error) {
 	r, err := s.Create(ctx, db, r)
 	if err != nil {
 		return r, err
@@ -154,14 +160,15 @@ func (s *releasesService) Rollback(ctx context.Context, db *gorm.DB, opts Rollba
 }
 
 // Release submits a release to the scheduler.
-func (s *releasesService) Release(ctx context.Context, release *Release, ss scheduler.StatusStream) error {
-	a := newSchedulerApp(release)
+func (s *releasesService) Release(ctx context.Context, release *Release, ss twelvefactor.StatusStream) error {
+	a, err := newSchedulerApp(release)
+	if err != nil {
+		return err
+	}
 	return s.Scheduler.Submit(ctx, a, ss)
 }
 
-// Restart will find the last release for an app and submit it to the scheduler
-// to restart the app.
-func (s *releasesService) Restart(ctx context.Context, db *gorm.DB, app *App) error {
+func (s *releasesService) ReleaseApp(ctx context.Context, db *gorm.DB, app *App, ss twelvefactor.StatusStream) error {
 	release, err := releasesFind(db, ReleasesQuery{App: app})
 	if err != nil {
 		if err == gorm.RecordNotFound {
@@ -175,8 +182,13 @@ func (s *releasesService) Restart(ctx context.Context, db *gorm.DB, app *App) er
 		return nil
 	}
 
-	a := newSchedulerApp(release)
-	return s.Scheduler.Restart(ctx, a, nil)
+	return s.Release(ctx, release, ss)
+}
+
+// Restart will find the last release for an app and submit it to the scheduler
+// to restart the app.
+func (s *releasesService) Restart(ctx context.Context, db *gorm.DB, app *App) error {
+	return s.Scheduler.Restart(ctx, app.ID, nil)
 }
 
 // These associations are always available on a Release.
@@ -274,11 +286,27 @@ func releasesCreate(db *gorm.DB, release *Release) (*Release, error) {
 	return release, nil
 }
 
-func newSchedulerApp(release *Release) *scheduler.App {
-	var processes []*scheduler.Process
+func newSchedulerApp(release *Release) (*twelvefactor.Manifest, error) {
+	var processes []*twelvefactor.Process
 
 	for name, p := range release.Formation {
-		processes = append(processes, newSchedulerProcess(release, name, p))
+		if p.NoService {
+			// If the entry is marked as "NoService", don't send it
+			// to the backend.
+			continue
+		}
+
+		if p.Quantity < 0 {
+			// If the process is scaled to a negative value, don't
+			// send it to the backend.
+			continue
+		}
+
+		process, err := newSchedulerProcess(release, name, p)
+		if err != nil {
+			return nil, err
+		}
+		processes = append(processes, process)
 	}
 
 	env := environment(release.Config.Vars)
@@ -292,39 +320,66 @@ func newSchedulerApp(release *Release) *scheduler.App {
 		"empire.app.release": fmt.Sprintf("v%d", release.Version),
 	}
 
-	return &scheduler.App{
-		ID:        release.App.ID,
+	return &twelvefactor.Manifest{
+		AppID:     release.App.ID,
 		Name:      release.App.Name,
 		Release:   fmt.Sprintf("v%d", release.Version),
 		Processes: processes,
 		Env:       env,
 		Labels:    labels,
-	}
+	}, nil
 }
 
-func newSchedulerProcess(release *Release, name string, p Process) *scheduler.Process {
-	env := map[string]string{
-		"EMPIRE_PROCESS": name,
-		"SOURCE":         fmt.Sprintf("%s.%s.v%d", release.App.Name, name, release.Version),
+func newSchedulerProcess(release *Release, name string, p Process) (*twelvefactor.Process, error) {
+	env := make(map[string]string)
+	for k, v := range p.Environment {
+		env[k] = v
 	}
+
+	env["EMPIRE_PROCESS"] = name
+	env["EMPIRE_PROCESS_SCALE"] = fmt.Sprintf("%d", p.Quantity)
+	env["SOURCE"] = fmt.Sprintf("%s.%s.v%d", release.App.Name, name, release.Version)
 
 	labels := map[string]string{
 		"empire.app.process": name,
 	}
 
-	return &scheduler.Process{
-		Type:        name,
-		Env:         env,
-		Labels:      labels,
-		Command:     []string(p.Command),
-		Image:       release.Slug.Image,
-		Instances:   uint(p.Quantity),
-		MemoryLimit: uint(p.Memory),
-		CPUShares:   uint(p.CPUShare),
-		Nproc:       uint(p.Nproc),
-		Exposure:    processExposure(release.App, name),
-		Schedule:    processSchedule(name, p),
+	var (
+		exposure *twelvefactor.Exposure
+		err      error
+	)
+	// For `web` processes defined in the standard procfile, we'll
+	// generate a default exposure setting and also set the PORT
+	// environment variable for backwards compatability.
+	if name == webProcessType && len(p.Ports) == 0 {
+		exposure = standardWebExposure(release.App)
+		env["PORT"] = "8080"
+	} else {
+		exposure, err = processExposure(release.App, name, p)
+		if err != nil {
+			return nil, err
+		}
 	}
+
+	quantity := p.Quantity
+	if release.App.Maintenance {
+		quantity = 0
+	}
+
+	return &twelvefactor.Process{
+		Type:      name,
+		Env:       env,
+		Labels:    labels,
+		Command:   []string(p.Command),
+		Image:     release.Slug.Image,
+		Quantity:  quantity,
+		Memory:    uint(p.Memory),
+		CPUShares: uint(p.CPUShare),
+		Nproc:     uint(p.Nproc),
+		Exposure:  exposure,
+		Schedule:  processSchedule(name, p),
+		ECS:       p.ECS,
+	}, nil
 }
 
 // environment coerces a Vars into a map[string]string.
@@ -338,31 +393,80 @@ func environment(vars Vars) map[string]string {
 	return env
 }
 
-func processExposure(app *App, process string) *scheduler.Exposure {
-	// For now, only the `web` process can be exposed.
-	if process != webProcessType {
-		return nil
+// standardWebExposure generates a scheduler.Exposure for a web process in the
+// standard Procfile format.
+func standardWebExposure(app *App) *twelvefactor.Exposure {
+	ports := []twelvefactor.Port{
+		{
+			Container: 8080,
+			Host:      80,
+			Protocol:  &twelvefactor.HTTP{},
+		},
 	}
 
-	exposure := &scheduler.Exposure{
+	// If a certificate is attached to the "web" process, add an SSL port.
+	if cert, ok := app.Certs[webProcessType]; ok {
+		ports = append(ports, twelvefactor.Port{
+			Container: 8080,
+			Host:      443,
+			Protocol: &twelvefactor.HTTPS{
+				Cert: cert,
+			},
+		})
+	}
+
+	return &twelvefactor.Exposure{
 		External: app.Exposure == exposePublic,
+		Ports:    ports,
 	}
-
-	switch app.Cert {
-	case "":
-		exposure.Type = &scheduler.HTTPExposure{}
-	default:
-		exposure.Type = &scheduler.HTTPSExposure{
-			Cert: app.Cert,
-		}
-	}
-
-	return exposure
 }
 
-func processSchedule(name string, p Process) scheduler.Schedule {
+func processExposure(app *App, name string, process Process) (*twelvefactor.Exposure, error) {
+	// No ports == not exposed
+	if len(process.Ports) == 0 {
+		return nil, nil
+	}
+
+	var ports []twelvefactor.Port
+	for _, p := range process.Ports {
+		var protocol twelvefactor.Protocol
+		switch p.Protocol {
+		case "http":
+			protocol = &twelvefactor.HTTP{}
+		case "https":
+			cert, ok := app.Certs[name]
+			if !ok {
+				return nil, &NoCertError{Process: name}
+			}
+			protocol = &twelvefactor.HTTPS{
+				Cert: cert,
+			}
+		case "tcp":
+			protocol = &twelvefactor.TCP{}
+		case "ssl":
+			cert, ok := app.Certs[name]
+			if !ok {
+				return nil, &NoCertError{Process: name}
+			}
+			protocol = &twelvefactor.SSL{
+				Cert: cert,
+			}
+		}
+		ports = append(ports, twelvefactor.Port{
+			Host:      p.Host,
+			Container: p.Container,
+			Protocol:  protocol,
+		})
+	}
+	return &twelvefactor.Exposure{
+		External: app.Exposure == exposePublic,
+		Ports:    ports,
+	}, nil
+}
+
+func processSchedule(name string, p Process) twelvefactor.Schedule {
 	if p.Cron != nil {
-		return scheduler.CRONSchedule(*p.Cron)
+		return twelvefactor.CRONSchedule(*p.Cron)
 	}
 
 	return nil

@@ -1,11 +1,13 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"log"
 	"net/url"
 	"os"
+	"strings"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
@@ -13,29 +15,44 @@ import (
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 	cf "github.com/aws/aws-sdk-go/service/cloudformation"
+	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/aws/aws-sdk-go/service/ecr"
+	"github.com/aws/aws-sdk-go/service/ecs"
 	"github.com/inconshreveable/log15"
 	"github.com/remind101/empire"
 	"github.com/remind101/empire/events/app"
 	"github.com/remind101/empire/events/sns"
 	"github.com/remind101/empire/events/stdout"
+	"github.com/remind101/empire/logs"
 	"github.com/remind101/empire/pkg/dockerauth"
 	"github.com/remind101/empire/pkg/dockerutil"
-	"github.com/remind101/empire/pkg/ecsutil"
 	"github.com/remind101/empire/pkg/troposphere"
-	"github.com/remind101/empire/scheduler"
+	"github.com/remind101/empire/procfile"
+	"github.com/remind101/empire/registry"
 	"github.com/remind101/empire/scheduler/cloudformation"
 	"github.com/remind101/empire/scheduler/docker"
-	"github.com/remind101/empire/scheduler/ecs"
 	"github.com/remind101/empire/stats"
+	"github.com/remind101/empire/twelvefactor"
 	"github.com/remind101/pkg/reporter"
-	"github.com/remind101/pkg/reporter/hb"
+	"github.com/remind101/pkg/reporter/config"
 )
 
 // DB ===================================
 
 func newDB(c *Context) (*empire.DB, error) {
-	return empire.OpenDB(c.String(FlagDB))
+	db, err := empire.OpenDB(c.String(FlagDB))
+	if err != nil {
+		return nil, err
+	}
+
+	db.Schema = &empire.Schema{
+		InstancePortPool: &empire.InstancePortPool{
+			Start: uint(c.Int(FlagInstancePortPoolStart)),
+			End:   uint(c.Int(FlagInstancePortPoolEnd)),
+		},
+	}
+
+	return db, nil
 }
 
 // Empire ===============================
@@ -66,14 +83,25 @@ func newEmpire(db *empire.DB, c *Context) (*empire.Empire, error) {
 		return nil, err
 	}
 
+	reg, err := newRegistry(docker, c)
+	if err != nil {
+		return nil, err
+	}
+
 	e := empire.New(db)
 	e.Scheduler = scheduler
-	e.Secret = []byte(c.String(FlagSecret))
 	e.EventStream = empire.AsyncEvents(streams)
-	e.ProcfileExtractor = empire.PullAndExtract(docker)
+	e.ImageRegistry = reg
 	e.Environment = c.String(FlagEnvironment)
 	e.RunRecorder = runRecorder
 	e.MessagesRequired = c.Bool(FlagMessagesRequired)
+
+	switch c.String(FlagAllowedCommands) {
+	case "procfile":
+		e.AllowedCommands = empire.AllowCommandProcfile
+	default:
+	}
+
 	if logs != nil {
 		e.LogsStreamer = logs
 	}
@@ -83,17 +111,13 @@ func newEmpire(db *empire.DB, c *Context) (*empire.Empire, error) {
 
 // Scheduler ============================
 
-func newScheduler(db *empire.DB, c *Context) (scheduler.Scheduler, error) {
+func newScheduler(db *empire.DB, c *Context) (empire.Scheduler, error) {
 	var (
-		s   scheduler.Scheduler
+		s   empire.Scheduler
 		err error
 	)
 
 	switch c.String(FlagScheduler) {
-	case "ecs":
-		s, err = newECSScheduler(db, c)
-	case "cloudformation-migration":
-		s, err = newMigrationScheduler(db, c)
 	case "cloudformation":
 		s, err = newCloudFormationScheduler(db, c)
 	default:
@@ -102,6 +126,12 @@ func newScheduler(db *empire.DB, c *Context) (scheduler.Scheduler, error) {
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize %s scheduler: %v", c.String(FlagScheduler), err)
+	}
+
+	// If ECS tasks support being attached to with a TTY + stdin, let the
+	// CloudFormation backend run attached processes.
+	if c.Bool(FlagECSAttachedEnabled) {
+		return s, nil
 	}
 
 	d, err := newDockerClient(c)
@@ -114,26 +144,10 @@ func newScheduler(db *empire.DB, c *Context) (scheduler.Scheduler, error) {
 	return a, nil
 }
 
-func newMigrationScheduler(db *empire.DB, c *Context) (*cloudformation.MigrationScheduler, error) {
-	log.Println("Using the CloudFormation Migration backend")
-
-	es, err := newECSScheduler(db, c)
-	if err != nil {
-		return nil, fmt.Errorf("error creating ecs scheduler: %v", err)
-	}
-
-	cs, err := newCloudFormationScheduler(db, c)
-	if err != nil {
-		return nil, fmt.Errorf("error creating cloudformation scheduler: %v", err)
-	}
-
-	return cloudformation.NewMigrationScheduler(db.DB.DB(), cs, es), nil
-}
-
-func newCloudFormationScheduler(db *empire.DB, c *Context) (*cloudformation.Scheduler, error) {
+func newCloudFormationScheduler(db *empire.DB, c *Context) (twelvefactor.Scheduler, error) {
 	logDriver := c.String(FlagECSLogDriver)
 	logOpts := c.StringSlice(FlagECSLogOpts)
-	logConfiguration := ecsutil.NewLogConfiguration(logDriver, logOpts)
+	logConfiguration := newLogConfiguration(logDriver, logOpts)
 
 	zoneID := c.String(FlagRoute53InternalZoneID)
 	zone, err := cloudformation.HostedZone(c, zoneID)
@@ -142,6 +156,7 @@ func newCloudFormationScheduler(db *empire.DB, c *Context) (*cloudformation.Sche
 	}
 
 	t := &cloudformation.EmpireTemplate{
+		VpcId:                   c.String(FlagELBVpcId),
 		Cluster:                 c.String(FlagECSCluster),
 		InternalSecurityGroupID: c.String(FlagELBSGPrivate),
 		ExternalSecurityGroupID: c.String(FlagELBSGPublic),
@@ -168,9 +183,30 @@ func newCloudFormationScheduler(db *empire.DB, c *Context) (*cloudformation.Sche
 	s := cloudformation.NewScheduler(db.DB.DB(), c)
 	s.Cluster = c.String(FlagECSCluster)
 	s.Template = t
-	s.StackNameTemplate = prefixedStackName(c.String(FlagEnvironment))
+	if v := c.String(FlagCloudFormationStackNameTemplate); v != "" {
+		s.StackNameTemplate = stackNameTemplate(v)
+	} else {
+		s.StackNameTemplate = prefixedStackName(c.String(FlagEnvironment))
+	}
 	s.Bucket = c.String(FlagS3TemplateBucket)
 	s.Tags = tags
+	s.NewDockerClient = func(ec2Instance *ec2.Instance) (cloudformation.DockerClient, error) {
+		certPath := c.String(FlagECSDockerCert)
+		host := ec2Instance.PrivateIpAddress
+		if host == nil {
+			return nil, fmt.Errorf("instance %s does not have a private ip address", aws.StringValue(ec2Instance.InstanceId))
+		}
+		port := "2376"
+		if certPath == "" {
+			port = "2375"
+		}
+		c, err := dockerutil.NewDockerClient(fmt.Sprintf("tcp://%s:%s", *host, port), certPath)
+		if err != nil {
+			return c, err
+		}
+		// Ping the host, just to make sure we can connect.
+		return c, c.Ping()
+	}
 
 	log.Println("Using CloudFormation backend with the following configuration:")
 	log.Println(fmt.Sprintf("  Cluster: %v", s.Cluster))
@@ -181,62 +217,96 @@ func newCloudFormationScheduler(db *empire.DB, c *Context) (*cloudformation.Sche
 	log.Println(fmt.Sprintf("  ZoneID: %v", zoneID))
 	log.Println(fmt.Sprintf("  LogConfiguration: %v", t.LogConfiguration))
 
+	if v := c.String(FlagECSPlacementConstraintsDefault); v != "" {
+		var placementConstraints []*ecs.PlacementConstraint
+		if err := json.Unmarshal([]byte(v), &placementConstraints); err != nil {
+			return nil, fmt.Errorf("unable to unmarshal placement constraints: %v", err)
+		}
+		log.Println(fmt.Sprintf("  DefaultPlacementConstraints: %v", placementConstraints))
+		return twelvefactor.Transform(s, setDefaultPlacementConstraints(placementConstraints)), nil
+	}
+
 	return s, nil
+}
+
+func setDefaultPlacementConstraints(placementConstraints []*ecs.PlacementConstraint) func(*twelvefactor.Manifest) *twelvefactor.Manifest {
+	return func(m *twelvefactor.Manifest) *twelvefactor.Manifest {
+		for _, p := range m.Processes {
+			if p.ECS == nil {
+				p.ECS = &procfile.ECS{}
+			}
+
+			if p.ECS.PlacementConstraints == nil {
+				p.ECS.PlacementConstraints = placementConstraints
+			}
+		}
+		return m
+	}
+}
+
+func newLogConfiguration(logDriver string, logOpts []string) *ecs.LogConfiguration {
+	if logDriver == "" {
+		// Default to the docker daemon default logging driver.
+		return nil
+	}
+
+	logOptions := make(map[string]*string)
+
+	for _, opt := range logOpts {
+		logOpt := strings.SplitN(opt, "=", 2)
+		if len(logOpt) == 2 {
+			logOptions[logOpt[0]] = &logOpt[1]
+		}
+	}
+
+	return &ecs.LogConfiguration{
+		LogDriver: aws.String(logDriver),
+		Options:   logOptions,
+	}
 }
 
 // prefixedStackName returns a text/template that prefixes the stack name with
 // the given prefix, if it's set.
 func prefixedStackName(prefix string) *template.Template {
 	t := `{{ if "` + prefix + `" }}{{"` + prefix + `"}}-{{ end }}{{.Name}}`
-	return template.Must(template.New("stack_name").Parse(t))
+	return stackNameTemplate(t)
 }
 
-func newECSScheduler(db *empire.DB, c *Context) (*ecs.Scheduler, error) {
-	logDriver := c.String(FlagECSLogDriver)
-	logOpts := c.StringSlice(FlagECSLogOpts)
-	logConfiguration := ecsutil.NewLogConfiguration(logDriver, logOpts)
-
-	config := ecs.Config{
-		AWS:                     c,
-		Cluster:                 c.String(FlagECSCluster),
-		ServiceRole:             c.String(FlagECSServiceRole),
-		InternalSecurityGroupID: c.String(FlagELBSGPrivate),
-		ExternalSecurityGroupID: c.String(FlagELBSGPublic),
-		InternalSubnetIDs:       c.StringSlice(FlagEC2SubnetsPrivate),
-		ExternalSubnetIDs:       c.StringSlice(FlagEC2SubnetsPublic),
-		ZoneID:                  c.String(FlagRoute53InternalZoneID),
-		LogConfiguration:        logConfiguration,
-	}
-
-	s, err := ecs.NewLoadBalancedScheduler(db.DB.DB(), config)
-	if err != nil {
-		return nil, err
-	}
-
-	log.Println("Using ECS backend with the following configuration:")
-	log.Println(fmt.Sprintf("  Cluster: %v", config.Cluster))
-	log.Println(fmt.Sprintf("  ServiceRole: %v", config.ServiceRole))
-	log.Println(fmt.Sprintf("  InternalSecurityGroupID: %v", config.InternalSecurityGroupID))
-	log.Println(fmt.Sprintf("  ExternalSecurityGroupID: %v", config.ExternalSecurityGroupID))
-	log.Println(fmt.Sprintf("  InternalSubnetIDs: %v", config.InternalSubnetIDs))
-	log.Println(fmt.Sprintf("  ExternalSubnetIDs: %v", config.ExternalSubnetIDs))
-	log.Println(fmt.Sprintf("  ZoneID: %v", config.ZoneID))
-	log.Println(fmt.Sprintf("  LogConfiguration: %v", logConfiguration))
-
-	return s, nil
+func stackNameTemplate(t string) *template.Template {
+	return template.Must(template.New("stack_name").Parse(t))
 }
 
 // DockerClient ========================
 
 func newDockerClient(c *Context) (*dockerutil.Client, error) {
-	socket := c.String(FlagDockerSocket)
+	host := c.String(FlagDockerHost)
 	certPath := c.String(FlagDockerCert)
 	authProvider, err := newAuthProvider(c)
 	if err != nil {
 		return nil, err
 	}
 
-	return dockerutil.NewClient(authProvider, socket, certPath)
+	return dockerutil.NewClient(authProvider, host, certPath)
+}
+
+func newRegistry(client *dockerutil.Client, c *Context) (empire.ImageRegistry, error) {
+	r := registry.DockerDaemon(client)
+
+	digests := c.String(FlagDockerDigests)
+	switch digests {
+	case "prefer":
+		r.Digests = registry.DigestsPrefer
+	case "enforce":
+		log.Println("Image digests are enforced")
+		r.Digests = registry.DigestsOnly
+	case "disable":
+		log.Println("Image digests are disabled")
+		r.Digests = registry.DigestsDisable
+	default:
+		return nil, fmt.Errorf("invalid value for %s: %s", FlagDockerDigests, digests)
+	}
+
+	return r, nil
 }
 
 // LogStreamer =========================
@@ -253,7 +323,7 @@ func newLogsStreamer(c *Context) (empire.LogsStreamer, error) {
 
 func newKinesisLogsStreamer(c *Context) (empire.LogsStreamer, error) {
 	log.Println("Using Kinesis backend for log streaming")
-	return empire.NewKinesisLogsStreamer(), nil
+	return logs.NewKinesisLogsStreamer(), nil
 }
 
 // Events ==============================
@@ -321,10 +391,10 @@ func newRunRecorder(c *Context) (empire.RunRecorder, error) {
 		log.Println("Using CloudWatch run logs backend with the following configuration:")
 		log.Println(fmt.Sprintf("  LogGroup: %s", group))
 
-		return empire.RecordToCloudWatch(group, c), nil
+		return logs.RecordToCloudWatch(group, c), nil
 	case "stdout":
 		log.Println("Using Stdout run logs backend")
-		return empire.RecordTo(os.Stdout), nil
+		return logs.RecordTo(os.Stdout), nil
 	default:
 		panic(fmt.Sprintf("unknown run logs backend: %v", backend))
 	}
@@ -351,33 +421,11 @@ func newLogger(c *Context) (log15.Logger, error) {
 // Reporter ============================
 
 func newReporter(c *Context) (reporter.Reporter, error) {
-	u := c.String(FlagReporter)
-	if u == "" {
-		return nil, nil
-	}
-
-	uri, err := url.Parse(u)
+	rep, err := config.NewReporterFromUrls(c.StringSlice(FlagReporter))
 	if err != nil {
-		return nil, err
+		panic(fmt.Errorf("couldn't create reporter: %#v", err))
 	}
-
-	switch uri.Scheme {
-	case "hb":
-		log.Println("Using Honeybadger to report errors")
-		q := uri.Query()
-		return newHBReporter(q.Get("key"), q.Get("environment"))
-	default:
-		panic(fmt.Errorf("unknown reporter: %s", u))
-	}
-}
-
-func newHBReporter(key, env string) (reporter.Reporter, error) {
-	r := hb.NewReporter(key)
-	r.Environment = env
-
-	// Append here because `go vet` will complain about unkeyed fields,
-	// since it thinks MultiReporter is a struct literal.
-	return append(reporter.MultiReporter{}, reporter.NewLogReporter(), r), nil
+	return rep, nil
 }
 
 // Stats =======================

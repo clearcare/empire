@@ -44,3 +44,56 @@ When provided, signifies that the process is a scheduled process. The value shou
 ```yaml
 cron: * * * * * * // Run once every minute
 ```
+
+**Noservice**
+
+When provided, signifies that the process is an "operational" one off command. These processes will not get any AWS resources attached to them.
+
+This can be used to alias a common command, or by enforcing whitelisting of commands for `emp run`.
+
+```yaml
+noservice: true
+```
+
+**Ports**
+
+This allows you to define what ports to expose, and what protocol to expose them with. This works similarly to the `ports:` attribute in docker-compose.yml.
+
+```yaml
+ports:
+  # Map port 80 on the container, as port 80 on the load balancer, using the default protocol.
+  - "80"
+  # Map port 8080 on the container, as port 80 on the load balancer, using the default protocol.
+  - "80:8080"
+  # Map port 5678 on the container, as port 5678 on the load balancer, using the tcp protocol.
+  - "5678":
+      protocol: "tcp"
+```
+
+**Environment**
+
+This allows you to set process specific environment variables. If these are set with `emp set`, the value within the Procfile will take precendence.
+
+```yaml
+environment:
+  EMPIRE_X_LOAD_BALANCER_TYPE: "alb"
+```
+
+See [documentation about deploying an application](../docs/deploying_an_application.md#environment-variables)
+for a list of other supported environment variables.
+
+**ECS**
+
+This allows you to specify any ECS specific properties, like placement strategies and constraints:
+
+```yaml
+ecs:
+  placement_constraints:
+    - type: memberOf
+      expression: "attribute:ecs.instance-type =~ t2.*"
+  placement_strategy:
+    - type: spread
+      field: "attribute:ecs.availability-zone"
+```
+
+See http://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-placement.html for details.

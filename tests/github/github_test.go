@@ -8,8 +8,9 @@ import (
 
 	"github.com/ejholmes/hookshot/events"
 	"github.com/ejholmes/hookshot/hooker"
+	"github.com/remind101/empire"
 	"github.com/remind101/empire/empiretest"
-	"github.com/remind101/empire/scheduler"
+	"github.com/remind101/empire/twelvefactor"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -68,8 +69,10 @@ func newClient(t testing.TB) *client {
 	s := empiretest.NewServer(t, e)
 
 	c := hooker.NewClient(nil)
-	c.URL = s.URL
+	c.URL = s.URL()
 	c.Secret = "abcd"
+
+	s.Start()
 
 	return &client{
 		Server: s,
@@ -78,11 +81,11 @@ func newClient(t testing.TB) *client {
 }
 
 type mockScheduler struct {
-	scheduler.Scheduler
+	empire.Scheduler
 	image chan string
 }
 
-func (m *mockScheduler) Submit(_ context.Context, app *scheduler.App, ss scheduler.StatusStream) error {
+func (m *mockScheduler) Submit(_ context.Context, app *twelvefactor.Manifest, ss twelvefactor.StatusStream) error {
 	m.image <- app.Processes[0].Image.String()
 	return nil
 }

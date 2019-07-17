@@ -8,11 +8,10 @@ import (
 	"io"
 	"strings"
 
-	"code.google.com/p/go-uuid/uuid"
-
 	"github.com/fsouza/go-dockerclient"
+	"github.com/remind101/empire/internal/uuid"
 	"github.com/remind101/empire/pkg/dockerutil"
-	"github.com/remind101/empire/scheduler"
+	"github.com/remind101/empire/twelvefactor"
 	"golang.org/x/net/context"
 )
 
@@ -58,13 +57,13 @@ type AttachedScheduler struct {
 	// processes interact with a single Docker daemon.
 	ShowAttached bool
 
-	scheduler.Scheduler
+	twelvefactor.Scheduler
 	dockerScheduler *Scheduler
 }
 
 // RunAttachedWithDocker wraps a Scheduler to run attached Run's using a Docker
 // client.
-func RunAttachedWithDocker(s scheduler.Scheduler, client *dockerutil.Client) *AttachedScheduler {
+func RunAttachedWithDocker(s twelvefactor.Scheduler, client *dockerutil.Client) *AttachedScheduler {
 	return &AttachedScheduler{
 		Scheduler:       s,
 		dockerScheduler: NewScheduler(client),
@@ -73,26 +72,31 @@ func RunAttachedWithDocker(s scheduler.Scheduler, client *dockerutil.Client) *At
 
 // Run runs attached processes using the docker scheduler, and detached
 // processes using the wrapped scheduler.
-func (s *AttachedScheduler) Run(ctx context.Context, app *scheduler.App, process *scheduler.Process, in io.Reader, out io.Writer) error {
+func (s *AttachedScheduler) Run(ctx context.Context, app *twelvefactor.Manifest) error {
+	if len(app.Processes) != 1 {
+		return fmt.Errorf("docker: cannot run mutliple processes with attached scheduler")
+	}
+
+	p := app.Processes[0]
 	// Attached means stdout, stdin is attached.
-	attached := out != nil || in != nil
+	attached := p.Stdin != nil || p.Stdout != nil || p.Stderr != nil
 
 	if attached {
-		return s.dockerScheduler.Run(ctx, app, process, in, out)
+		return s.dockerScheduler.Run(ctx, app)
 	} else {
-		return s.Scheduler.Run(ctx, app, process, in, out)
+		return s.Scheduler.Run(ctx, app)
 	}
 }
 
-// Instances returns a combination of instances from the wrapped scheduler, as
+// Tasks returns a combination of instances from the wrapped scheduler, as
 // well as instances from attached runs.
-func (s *AttachedScheduler) Instances(ctx context.Context, app string) ([]*scheduler.Instance, error) {
+func (s *AttachedScheduler) Tasks(ctx context.Context, app string) ([]*twelvefactor.Task, error) {
 	if !s.ShowAttached {
-		return s.Scheduler.Instances(ctx, app)
+		return s.Scheduler.Tasks(ctx, app)
 	}
 
 	type instancesResult struct {
-		instances []*scheduler.Instance
+		instances []*twelvefactor.Task
 		err       error
 	}
 
@@ -102,7 +106,7 @@ func (s *AttachedScheduler) Instances(ctx context.Context, app string) ([]*sched
 		ch <- instancesResult{attachedInstances, err}
 	}()
 
-	instances, err := s.Scheduler.Instances(ctx, app)
+	instances, err := s.Scheduler.Tasks(ctx, app)
 	if err != nil {
 		return instances, err
 	}
@@ -147,85 +151,86 @@ func NewScheduler(client *dockerutil.Client) *Scheduler {
 	}
 }
 
-func (s *Scheduler) Run(ctx context.Context, app *scheduler.App, p *scheduler.Process, in io.Reader, out io.Writer) error {
-	attached := out != nil || in != nil
+func (s *Scheduler) Run(ctx context.Context, app *twelvefactor.Manifest) error {
+	for _, p := range app.Processes {
+		attached := p.Stdin != nil || p.Stdout != nil || p.Stderr != nil
 
-	if !attached {
-		return errors.New("cannot run detached processes with Docker scheduler")
-	}
+		if !attached {
+			return errors.New("cannot run detached processes with Docker scheduler")
+		}
 
-	labels := scheduler.Labels(app, p)
-	labels[runLabel] = Attached
+		labels := twelvefactor.Labels(app, p)
+		labels[runLabel] = Attached
 
-	if err := s.docker.PullImage(ctx, docker.PullImageOptions{
-		Registry:     p.Image.Registry,
-		Repository:   p.Image.Repository,
-		Tag:          p.Image.Tag,
-		OutputStream: replaceNL(out),
-	}); err != nil {
-		return fmt.Errorf("error pulling image: %v", err)
-	}
+		if err := s.docker.PullImage(ctx, docker.PullImageOptions{
+			Registry:     p.Image.Registry,
+			Repository:   p.Image.Repository,
+			Tag:          p.Image.Tag,
+			OutputStream: replaceNL(p.Stderr),
+		}); err != nil {
+			return fmt.Errorf("error pulling image: %v", err)
+		}
 
-	container, err := s.docker.CreateContainer(ctx, docker.CreateContainerOptions{
-		Name: uuid.New(),
-		Config: &docker.Config{
-			Tty:          true,
-			AttachStdin:  true,
-			AttachStdout: true,
-			AttachStderr: true,
-			OpenStdin:    true,
-			Memory:       int64(p.MemoryLimit),
-			CPUShares:    int64(p.CPUShares),
-			Image:        p.Image.String(),
-			Cmd:          p.Command,
-			Env:          envKeys(scheduler.Env(app, p)),
-			Labels:       labels,
-		},
-		HostConfig: &docker.HostConfig{
-			LogConfig: docker.LogConfig{
-				Type: "json-file",
+		container, err := s.docker.CreateContainer(ctx, docker.CreateContainerOptions{
+			Name: uuid.New(),
+			Config: &docker.Config{
+				Tty:          true,
+				AttachStdin:  true,
+				AttachStdout: true,
+				AttachStderr: true,
+				OpenStdin:    true,
+				Memory:       int64(p.Memory),
+				CPUShares:    int64(p.CPUShares),
+				Image:        p.Image.String(),
+				Cmd:          p.Command,
+				Env:          envKeys(twelvefactor.Env(app, p)),
+				Labels:       labels,
 			},
-		},
-	})
-	if err != nil {
-		return fmt.Errorf("error creating container: %v", err)
-	}
-	defer s.docker.RemoveContainer(ctx, docker.RemoveContainerOptions{
-		ID:            container.ID,
-		RemoveVolumes: true,
-		Force:         true,
-	})
+			HostConfig: &docker.HostConfig{
+				LogConfig: docker.LogConfig{
+					Type: "json-file",
+				},
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("error creating container: %v", err)
+		}
+		defer s.docker.RemoveContainer(ctx, docker.RemoveContainerOptions{
+			ID:            container.ID,
+			RemoveVolumes: true,
+			Force:         true,
+		})
 
-	if err := s.docker.StartContainer(ctx, container.ID, nil); err != nil {
-		return fmt.Errorf("error starting container: %v", err)
-	}
-	defer tryClose(out)
+		if err := s.docker.StartContainer(ctx, container.ID, nil); err != nil {
+			return fmt.Errorf("error starting container: %v", err)
+		}
 
-	if err := s.docker.AttachToContainer(ctx, docker.AttachToContainerOptions{
-		Container:    container.ID,
-		InputStream:  in,
-		OutputStream: out,
-		ErrorStream:  out,
-		Logs:         true,
-		Stream:       true,
-		Stdin:        true,
-		Stdout:       true,
-		Stderr:       true,
-		RawTerminal:  true,
-	}); err != nil {
-		return fmt.Errorf("error attaching to container: %v", err)
+		if err := s.docker.AttachToContainer(ctx, docker.AttachToContainerOptions{
+			Container:    container.ID,
+			InputStream:  p.Stdin,
+			OutputStream: p.Stdout,
+			ErrorStream:  p.Stderr,
+			Logs:         true,
+			Stream:       true,
+			Stdin:        true,
+			Stdout:       true,
+			Stderr:       true,
+			RawTerminal:  true,
+		}); err != nil {
+			return fmt.Errorf("error attaching to container: %v", err)
+		}
 	}
 
 	return nil
 }
 
-func (s *Scheduler) Instances(ctx context.Context, app string) ([]*scheduler.Instance, error) {
+func (s *Scheduler) Instances(ctx context.Context, app string) ([]*twelvefactor.Task, error) {
 	return s.InstancesFromAttachedRuns(ctx, app)
 }
 
 // InstancesFromAttachedRuns returns Instances that were started from attached
 // runs.
-func (s *Scheduler) InstancesFromAttachedRuns(ctx context.Context, app string) ([]*scheduler.Instance, error) {
+func (s *Scheduler) InstancesFromAttachedRuns(ctx context.Context, app string) ([]*twelvefactor.Task, error) {
 	// Filter only docker containers that were started as an attached run.
 	attached := fmt.Sprintf("%s=%s", runLabel, Attached)
 	return s.instances(ctx, app, attached)
@@ -233,8 +238,8 @@ func (s *Scheduler) InstancesFromAttachedRuns(ctx context.Context, app string) (
 
 // instances returns docker container instances for this app, optionally
 // filtered with labels.
-func (s *Scheduler) instances(ctx context.Context, app string, labels ...string) ([]*scheduler.Instance, error) {
-	var instances []*scheduler.Instance
+func (s *Scheduler) instances(ctx context.Context, app string, labels ...string) ([]*twelvefactor.Task, error) {
+	var instances []*twelvefactor.Task
 
 	containers, err := s.docker.ListContainers(docker.ListContainersOptions{
 		Filters: map[string][]string{
@@ -255,16 +260,16 @@ func (s *Scheduler) instances(ctx context.Context, app string, labels ...string)
 
 		state := strings.ToUpper(container.State.StateString())
 
-		instances = append(instances, &scheduler.Instance{
+		instances = append(instances, &twelvefactor.Task{
 			ID:        container.ID[0:12],
 			State:     state,
 			UpdatedAt: container.State.StartedAt,
-			Process: &scheduler.Process{
-				Type:        container.Config.Labels[processLabel],
-				Command:     container.Config.Cmd,
-				Env:         parseEnv(container.Config.Env),
-				MemoryLimit: uint(container.HostConfig.Memory),
-				CPUShares:   uint(container.HostConfig.CPUShares),
+			Process: &twelvefactor.Process{
+				Type:      container.Config.Labels[processLabel],
+				Command:   container.Config.Cmd,
+				Env:       parseEnv(container.Config.Env),
+				Memory:    uint(container.HostConfig.Memory),
+				CPUShares: uint(container.HostConfig.CPUShares),
 			},
 		})
 	}
@@ -312,14 +317,6 @@ func envKeys(env map[string]string) []string {
 	}
 
 	return s
-}
-
-func tryClose(w io.Writer) error {
-	if w, ok := w.(io.Closer); ok {
-		return w.Close()
-	}
-
-	return nil
 }
 
 // replaceNL returns an io.Writer that will replace "\n" with "\r\n" in the

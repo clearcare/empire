@@ -2,9 +2,22 @@
 
 The following documents the various configuration parameters that you can use to tailor your Empire environment to your needs.
 
+If you're configuring for production, make sure to read through [production best practices](./production_best_practices.md).
+
 ### GitHub Authentication
 
-**TODO**
+1. Create new OAuth application in Github
+   https://github.com/organizations/:orgname/settings/applications/new
+   https://github.com/settings/applications/new
+2. Get Client ID & Client Secret
+3. Use them in `EMPIRE_GITHUB_CLIENT_ID` and `EMPIRE_GITHUB_CLIENT_SECRET`
+4. Set `EMPIRE_SERVER_AUTH=github`.
+
+It's recommended that you also set either `EMPIRE_GITHUB_ORGANIZATION`, or `EMPIRE_GITHUB_TEAM_ID` to ensure that only members of your GitHub organization/team are able to access your Empire environment.
+
+### SAML Authentication
+
+Refer to the [docs](./saml.md) on configuring the SAML authentication backend.
 
 ### GitHub Deployments
 
@@ -93,3 +106,53 @@ exports.handler = function(event, context) {
   });
 };
 ```
+
+### ECR Repositories
+
+Empire can deploy images from repositories hosted on the EC2 Container Registry (ECR). To authenticate against (and pull from) ECR repositories, the ECS container instances must be running version 1.7.0 or higher of the ECS Container Agent. Furthermore, the container instance role (for both Empire, and the instances in the ECS cluster that Empire is deploying to) must include the `ecr:GetAuthorizationToken`, `ecr:BatchCheckLayerAvailability`, `ecr:GetDownloadUrlForLayer`, and `ecr:BatchGetImage` privileges. If you are running Empire outside of your ECS cluster, you should also ensure that these privileges are set for the user or role associated with Empire. If you will not be using other private Docker registries, you might want to disable the Docker authentication provider by setting the `-docker.auth` flag (or the corresponding `DOCKER_AUTH_PATH` environment variable) to an empty string.
+
+With the above configuration in place, deploying from ECR is no different than deploying from other private Docker registries. However: due to [GH-857](https://github.com/remind101/empire/issues/857), ECR image references that do not contain at least two forward slashes are currently unsupported. That is, `awsaccountid.dkr.ecr.us-west-2.amazonaws.com/prod/myimage:tag` will work; `awsaccountid.dkr.ecr.us-west-2.amazonaws.com/myimage:tag` will not.
+
+### Log Streaming
+
+By default, log streaming is deactivated in Empire. If you try to run
+`emp log -a <app>`, you will get the following response:
+
+```console
+$ emp log -a acme-inc
+Logs are disabled
+```
+
+To activate log streaming on Empire, you need to set the `EMPIRE_LOGS_STREAMER`
+environment variable on your Empire instance(s). Right now the only value supported
+is `kinesis`, but we hope to support more in the future.
+
+When using Amazon Kinesis log streaming, Empire will try to read the logs from the
+Kinesis stream named after the app id (the UUID Empire automatically assigns to your app, upon creation). This means that the Kinesis streams need to pre-exist
+with logs in them before Empire can forward them to your terminal. We use [logspout-kinesis](https://github.com/remind101/logspout-kinesis) to do so. Our official [Empire AMI](https://github.com/remind101/empire_ami) also takes care of running logspout and activating Kinesis log streaming on Empire.
+
+
+### Show attached runs in `emp ps`
+
+If you set `EMPIRE_X_SHOW_ATTACHED=true`, then Empire will include containers started with `emp run` when using `emp ps`. However, in order for this to work properly, Empire needs to talk to a _single_ Docker daemon. There's a couple of ways to accomplish this:
+
+#### Run a single instance of Empire
+
+The easiest solution is to run a single Empire instance, pointed at the Docker daemon on the host it's running on. This has some obvious disadvantages for availability.
+
+#### Use a dedicated Docker host
+
+In this configuration, you would create a dedicated Docker host, exposing the Docker daemon API over tcp with tls. You would then point multiple Empire instances at this single Docker daemon.
+
+#### Use Docker Swarm
+
+Theoretically, you could point Empire at multiple Docker daemons that are connected via Docker swarm.
+
+#### Use ECS
+
+By default, Empire will run attached processes entirely through the Docker daemon that you point Empire at. You can specify the `--ecs.attached.enabled` (`EMPIRE_ECS_ATTACHED_ENABLED`) to run attached processes via ECS. This method is not yet suitable for production, and there's some important caveats and tradeoff's to be aware of:
+
+1. It currently requires a [patch](https://github.com/remind101/empire/tree/master/contrib/amazon-ecs-agent/tty) to the Amazon ECS agent, to allow Empire to pass additional flags down to Docker when creating the container.
+2. Empire needs to be able to connect to the Docker daemon of container instances in the ECS cluster. If you do this, it's _highly_ encouraged that you only expose the Docker socket over TLS (https://docs.docker.com/engine/security/https/) and restrict your security groups to only allow Empire access to port 2376 on container instances.
+
+The primary benefit of this approach is that, by using ECS, attached runs can be easily scaled out to a group of hosts, and it also allows attached processes to benefit from AWS Roles for ECS tasks.

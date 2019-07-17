@@ -25,6 +25,28 @@ Scale changes the quantity of dynos (horizontal scale) and/or the
 dyno size (vertical scale) for each process type. Note that
 changing dyno size will restart all dynos of that type.
 
+size has two different formats, the first is the raw format,
+which gives you more control over the settings:
+
+	<cpu_share>:<memory>
+
+Examples:
+
+	# Scales the web process to one process that has 512 cpu
+	# shares and 1 gb of memory.
+	$ emp scale -a acme-inc web=1:512:1024mb
+
+	# Scales the web process to three processes that have
+	# 256 cpu shares and 2 gb of memory.
+	$ emp scale -a acme-inc web=3:256:2gb
+
+The other format is a set of preset values:
+
+	1X: 256 cpu share, 512mb of memory
+	2X: 512 cpu share, 1024mb of memory
+	PX: 1024 cpu share, 6gb of memory
+
+
 Options:
 
     -l display the current scale
@@ -75,8 +97,8 @@ func runScale(cmd *Command, args []string) {
 		types[pstype] = true
 
 		opt := heroku.FormationBatchUpdateOpts{Process: pstype}
-		if qty != -1 {
-			opt.Quantity = &qty
+		if qty != nil {
+			opt.Quantity = qty
 		}
 		if size != "" {
 			opt.Size = &size
@@ -115,8 +137,7 @@ func formatResults(formations []heroku.Formation) []string {
 
 var errInvalidScaleArg = errors.New("invalid argument")
 
-func parseScaleArg(arg string) (pstype string, qty int, size string, err error) {
-	qty = -1
+func parseScaleArg(arg string) (pstype string, qty *int, size string, err error) {
 	iEquals := strings.IndexRune(arg, '=')
 	if fields := strings.Fields(arg); len(fields) > 1 || iEquals == -1 {
 		err = errInvalidScaleArg
@@ -132,25 +153,27 @@ func parseScaleArg(arg string) (pstype string, qty int, size string, err error) 
 
 	if iColon := strings.IndexRune(rem, ':'); iColon == -1 {
 		if iX := strings.IndexRune(rem, 'X'); iX == -1 {
-			qty, err = strconv.Atoi(rem)
+			v, err := strconv.Atoi(rem)
 			if err != nil {
-				return pstype, -1, "", errInvalidScaleArg
+				return pstype, nil, "", errInvalidScaleArg
 			}
+			qty = &v
 		} else {
 			size = rem
 		}
 	} else {
 		if iColon > 0 {
-			qty, err = strconv.Atoi(rem[:iColon])
+			v, err := strconv.Atoi(rem[:iColon])
 			if err != nil {
-				return pstype, -1, "", errInvalidScaleArg
+				return pstype, nil, "", errInvalidScaleArg
 			}
+			qty = &v
 		}
 		if len(rem) > iColon+1 {
 			size = rem[iColon+1:]
 		}
 	}
-	if err != nil || qty == -1 && size == "" {
+	if err != nil || qty == nil && size == "" {
 		err = errInvalidScaleArg
 	}
 	return

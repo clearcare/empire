@@ -26,7 +26,13 @@ func NewAuthenticator(c *Client) *Authenticator {
 	return &Authenticator{client: c}
 }
 
-func (a *Authenticator) Authenticate(username, password, otp string) (*empire.User, error) {
+func (a *Authenticator) Authenticate(username, password, otp string) (*auth.Session, error) {
+	// GitHub authentication is guaranteed to fail if one of these are not
+	// present, so fail fast and avoid making an HTTP request.
+	if username == "" || password == "" {
+		return nil, auth.ErrForbidden
+	}
+
 	authorization, err := a.client.CreateAuthorization(CreateAuthorizationOptions{
 		Username: username,
 		Password: password,
@@ -39,19 +45,21 @@ func (a *Authenticator) Authenticate(username, password, otp string) (*empire.Us
 		case errUnauthorized:
 			return nil, auth.ErrForbidden
 		default:
-			return nil, err
+			return nil, fmt.Errorf("unable to create github authorization: %v", err)
 		}
 	}
 
 	u, err := a.client.GetUser(authorization.Token)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("unable to fetch GitHub user information: %v", err)
 	}
 
-	return &empire.User{
+	user := &empire.User{
 		Name:        u.Login,
 		GitHubToken: authorization.Token,
-	}, nil
+	}
+
+	return auth.NewSession(user), nil
 }
 
 // OrganizationAuthorizer is an implementation of the auth.Authorizer interface
@@ -77,7 +85,7 @@ func (a *OrganizationAuthorizer) Authorize(user *empire.User) error {
 
 	ok, err := a.client.IsOrganizationMember(a.Organization, user.GitHubToken)
 	if err != nil {
-		return err
+		return fmt.Errorf("error checking organization membership: %v", err)
 	}
 
 	if !ok {
@@ -110,7 +118,7 @@ func (a *TeamAuthorizer) Authorize(user *empire.User) error {
 
 	ok, err := a.client.IsTeamMember(a.TeamID, user.GitHubToken)
 	if err != nil {
-		return err
+		return fmt.Errorf("error checking team membership: %v", err)
 	}
 
 	if !ok {

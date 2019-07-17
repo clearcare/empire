@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -163,6 +164,7 @@ var cmdReleaseInfo = &Command{
 	Usage:    "release-info <version>",
 	NeedsApp: true,
 	Category: "release",
+	NumArgs:  1,
 	Short:    "show release info",
 	Long: `
 release-info shows detailed information about a release.
@@ -181,10 +183,8 @@ Examples:
 
 func runReleaseInfo(cmd *Command, args []string) {
 	appname := mustApp()
-	if len(args) != 1 {
-		cmd.PrintUsage()
-		os.Exit(2)
-	}
+	cmd.AssertNumArgsCorrect(args)
+
 	ver := strings.TrimPrefix(args[0], "v")
 	rel, err := client.ReleaseInfo(appname, ver)
 	must(err)
@@ -205,6 +205,7 @@ var cmdRollback = &Command{
 	NeedsApp:        true,
 	OptionalMessage: true,
 	Category:        "release",
+	NumArgs:         1,
 	Short:           "roll back to a previous release",
 	Long: `
 Rollback re-releases an app at an older version. This action
@@ -221,12 +222,32 @@ Examples:
 func runRollback(cmd *Command, args []string) {
 	appname := mustApp()
 	message := getMessage()
-	if len(args) != 1 {
-		cmd.PrintUsage()
-		os.Exit(2)
-	}
+	cmd.AssertNumArgsCorrect(args)
+
 	ver := strings.TrimPrefix(args[0], "v")
+	rollbackSafetyCheck(ver, appname)
+
 	rel, err := client.ReleaseRollback(appname, ver, message)
 	must(err)
 	log.Printf("Rolled back %s to v%s as v%d.\n", appname, ver, rel.Version)
+}
+
+func rollbackSafetyCheck(verStr, appname string) {
+	// Grab head release to get the current version
+	hrels, err := client.ReleaseList(appname, &heroku.ListRange{
+		Field:      "version",
+		Max:        1,
+		Descending: true,
+	})
+	must(err)
+
+	currVer := hrels[0].Version
+	verNum, err := strconv.Atoi(verStr)
+	must(err)
+
+	diff := currVer - verNum
+	if diff >= 10 {
+		warning := fmt.Sprintf("Attempting to rollback %d versions from v%d to v%d. Type v%d to continue:", diff, currVer, verNum, verNum)
+		mustConfirm(warning, fmt.Sprintf("v%s", verStr))
+	}
 }

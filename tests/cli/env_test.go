@@ -1,6 +1,9 @@
 package cli_test
 
 import (
+	"fmt"
+	"io/ioutil"
+	"os"
 	"testing"
 	"time"
 )
@@ -110,6 +113,29 @@ func TestConfigConsistency(t *testing.T) {
 		{
 			"env -a acme-inc",
 			"FOO1=foo1\nFOO2=foo2\nFOO3=foo3",
+		},
+	})
+}
+
+func TestEnvConfig(t *testing.T) {
+	f, err := ioutil.TempFile(os.TempDir(), "acme-inc.env")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+
+	content := []byte("FOO=bar\\nmoarbar\nBAR=foo")
+	f.Write(content)
+
+	run(t, []Command{
+		DeployCommand("latest", "v1"),
+		{
+			fmt.Sprintf("env-load %s -a acme-inc", f.Name()),
+			fmt.Sprintf("Updated env vars from %s and restarted acme-inc.", f.Name()),
+		},
+		{
+			"env -a acme-inc",
+			"BAR=foo\nFOO=bar\\nmoarbar",
 		},
 	})
 }

@@ -8,10 +8,10 @@ import (
 	"github.com/remind101/empire"
 	"github.com/remind101/empire/pkg/heroku"
 	"github.com/remind101/empire/pkg/hijack"
+	"github.com/remind101/empire/pkg/stdcopy"
 	streamhttp "github.com/remind101/empire/pkg/stream/http"
-	"github.com/remind101/pkg/httpx"
-	"github.com/remind101/pkg/timex"
-	"golang.org/x/net/context"
+	"github.com/remind101/empire/pkg/timex"
+	"github.com/remind101/empire/server/auth"
 )
 
 type Dyno heroku.Dyno
@@ -21,6 +21,7 @@ func newDyno(task *empire.Task) *Dyno {
 		Command:   task.Command.String(),
 		Type:      task.Type,
 		Name:      task.Name,
+		Host:      heroku.Host{Id: task.Host.ID},
 		State:     task.State,
 		Size:      task.Constraints.String(),
 		UpdatedAt: task.UpdatedAt,
@@ -37,8 +38,10 @@ func newDynos(tasks []*empire.Task) []*Dyno {
 	return dynos
 }
 
-func (h *Server) GetProcesses(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
-	a, err := findApp(ctx, h)
+func (h *Server) GetProcesses(w http.ResponseWriter, r *http.Request) error {
+	ctx := r.Context()
+
+	a, err := h.findApp(r)
 	if err != nil {
 		return err
 	}
@@ -60,10 +63,12 @@ type PostProcessForm struct {
 	Size    *empire.Constraints `json:"size"`
 }
 
-func (h *Server) PostProcess(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
+func (h *Server) PostProcess(w http.ResponseWriter, r *http.Request) error {
+	ctx := r.Context()
+
 	var form PostProcessForm
 
-	a, err := findApp(ctx, h)
+	a, err := h.findApp(r)
 	if err != nil {
 		return err
 	}
@@ -83,7 +88,7 @@ func (h *Server) PostProcess(ctx context.Context, w http.ResponseWriter, r *http
 	}
 
 	opts := empire.RunOpts{
-		User:        UserFromContext(ctx),
+		User:        auth.UserFromContext(ctx),
 		App:         a,
 		Command:     command,
 		Env:         form.Env,
@@ -92,8 +97,15 @@ func (h *Server) PostProcess(ctx context.Context, w http.ResponseWriter, r *http
 	}
 
 	if form.Attach {
+		multiplex := r.Header.Get("X-Multiplex") != ""
+
 		header := http.Header{}
-		header.Set("Content-Type", "application/vnd.empire.raw-stream")
+		if multiplex {
+			header.Set("Content-Type", "application/vnd.empire.stdcopy-stream")
+		} else {
+			header.Set("Content-Type", "application/vnd.empire.raw-stream")
+		}
+
 		stream := &hijack.HijackReadWriter{
 			Response: w,
 			Header:   header,
@@ -102,8 +114,18 @@ func (h *Server) PostProcess(ctx context.Context, w http.ResponseWriter, r *http
 		// Prevent the ELB idle connection timeout to close the connection.
 		defer close(streamhttp.Heartbeat(stream, 10*time.Second))
 
-		opts.Input = stream
-		opts.Output = stream
+		opts.Stdin = stream
+
+		if multiplex {
+			opts.Stdout = stdcopy.NewStdWriter(stream, stdcopy.Stdout)
+			opts.Stderr = stdcopy.NewStdWriter(stream, stdcopy.Stderr)
+		} else {
+			// Backwards compatibility for older clients that don't
+			// know how to de-multiplex a stdcopy stream. For these
+			// clients, stdout/stderr are merged together.
+			opts.Stdout = stream
+			opts.Stderr = stream
+		}
 
 		if err := h.Run(ctx, opts); err != nil {
 			if stream.Hijacked {
@@ -130,15 +152,17 @@ func (h *Server) PostProcess(ctx context.Context, w http.ResponseWriter, r *http
 	return nil
 }
 
-func (h *Server) DeleteProcesses(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
-	vars := httpx.Vars(ctx)
+func (h *Server) DeleteProcesses(w http.ResponseWriter, r *http.Request) error {
+	ctx := r.Context()
+
+	vars := Vars(r)
 	pid := vars["pid"]
 
 	if vars["ptype"] != "" {
 		return errNotImplemented("Restarting a process type is currently not implemented.")
 	}
 
-	a, err := findApp(ctx, h)
+	a, err := h.findApp(r)
 	if err != nil {
 		return err
 	}
@@ -149,7 +173,7 @@ func (h *Server) DeleteProcesses(ctx context.Context, w http.ResponseWriter, r *
 	}
 
 	if err := h.Restart(ctx, empire.RestartOpts{
-		User:    UserFromContext(ctx),
+		User:    auth.UserFromContext(ctx),
 		App:     a,
 		PID:     pid,
 		Message: m,
