@@ -29,6 +29,7 @@ type TaskDefinitionProperties struct {
 	ContainerDefinitions []*ContainerDefinitionProperties `json:",omitempty"`
 	Volumes              []interface{}
 	TaskRoleArn          interface{} `json:",omitempty"`
+	Cpu                  interface{}                      `json:",omitempty"`
 }
 
 type CustomTaskDefinitionProperties struct {
@@ -38,4 +39,5 @@ type CustomTaskDefinitionProperties struct {
 	ServiceToken         interface{}                      `json:",omitempty"`
 	Volumes              []interface{}
 	TaskRoleArn          interface{} `json:",omitempty"`
+	Cpu                  interface{}                      `json:",omitempty"`
 }

@@ -330,6 +330,15 @@ func (t *EmpireTemplate) addTaskDefinition(tmpl *troposphere.Template, app *twel
 			PlacementConstraints: placementConstraints,
 		}
 	} else {
+		var cpuLimit *int64
+		containerDefinitionCpuLimit, ok := containerDefinition.Cpu.(int64)
+		if ok {
+			cpuLimit = &containerDefinitionCpuLimit
+		}
+
+		//field := reflect.ValueOf(containerDefinition).Elem().FieldByName("Cpu")
+		//fmt.Println("Container CPU limit ", containerDefinition.Cpu, " ", ok, ok2, " (", use_reservation, ")", reflect.TypeOf(containerDefinition.Cpu), field.Tag)
+
 		containerDefinition.Environment = cd.Environment
 		taskDefinitionProperties = &TaskDefinitionProperties{
 			Volumes: []interface{}{},
@@ -338,6 +347,7 @@ func (t *EmpireTemplate) addTaskDefinition(tmpl *troposphere.Template, app *twel
 			},
 			TaskRoleArn:          taskRole,
 			PlacementConstraints: placementConstraints,
+			Cpu:                  cpuLimit,
 		}
 	}
 

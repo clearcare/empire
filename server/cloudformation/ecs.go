@@ -262,6 +262,7 @@ type ContainerDefinition struct {
 type ECSTaskDefinitionProperties struct {
 	Family               *string
 	TaskRoleArn          *string
+	Cpu                  *string
 	ContainerDefinitions []ContainerDefinition
 	PlacementConstraints []ECSPlacementConstraint
 }
