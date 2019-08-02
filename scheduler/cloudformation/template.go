@@ -332,7 +332,8 @@ func (t *EmpireTemplate) addTaskDefinition(tmpl *troposphere.Template, app *twel
 	} else {
 		var cpuLimit *int64
 		containerDefinitionCpuLimit, ok := containerDefinition.Cpu.(int64)
-		if ok {
+		use_reservation, ok2 := app.Env["EMPIRE_USE_CPU_RESERVATION"]
+		if ok && ok2 && use_reservation == "1" {
 			cpuLimit = &containerDefinitionCpuLimit
 		}
 
