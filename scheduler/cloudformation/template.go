@@ -339,16 +339,30 @@ func (t *EmpireTemplate) addTaskDefinition(tmpl *troposphere.Template, app *twel
 
 		//field := reflect.ValueOf(containerDefinition).Elem().FieldByName("Cpu")
 		//fmt.Println("Container CPU limit ", containerDefinition.Cpu, " ", ok, ok2, " (", use_reservation, ")", reflect.TypeOf(containerDefinition.Cpu), field.Tag)
+		fmt.Println("Container CPU limit:", containerDefinition.Cpu, " container CPU set:", ok, "env var exists:", ok2, " env var contents:", use_reservation)
 
 		containerDefinition.Environment = cd.Environment
-		taskDefinitionProperties = &TaskDefinitionProperties{
-			Volumes: []interface{}{},
-			ContainerDefinitions: []*ContainerDefinitionProperties{
-				containerDefinition,
-			},
-			TaskRoleArn:          taskRole,
-			PlacementConstraints: placementConstraints,
-			Cpu:                  cpuLimit,
+		if cpuLimit == nil {
+			fmt.Println("NOT setting task CPU hard limit")
+			taskDefinitionProperties = &TaskDefinitionProperties{
+					Volumes: []interface{}{},
+					ContainerDefinitions: []*ContainerDefinitionProperties{
+						containerDefinition,
+					},
+					TaskRoleArn:          taskRole,
+					PlacementConstraints: placementConstraints,
+			}
+		} else {
+			fmt.Println("Setting task CPU hard limit to match container CPU soft limit")
+			taskDefinitionProperties = &TaskDefinitionCpuProperties{
+				Volumes: []interface{}{},
+				ContainerDefinitions: []*ContainerDefinitionProperties{
+					containerDefinition,
+				},
+				TaskRoleArn:          taskRole,
+				PlacementConstraints: placementConstraints,
+				Cpu:                  cpuLimit,
+			}
 		}
 	}
 

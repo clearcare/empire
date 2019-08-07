@@ -29,6 +29,13 @@ type TaskDefinitionProperties struct {
 	ContainerDefinitions []*ContainerDefinitionProperties `json:",omitempty"`
 	Volumes              []interface{}
 	TaskRoleArn          interface{} `json:",omitempty"`
+}
+
+type TaskDefinitionCpuProperties struct {
+	PlacementConstraints []*PlacementConstraint           `json:",omitempty"`
+	ContainerDefinitions []*ContainerDefinitionProperties `json:",omitempty"`
+	Volumes              []interface{}
+	TaskRoleArn          interface{} `json:",omitempty"`
 	Cpu                  interface{}                      `json:",omitempty"`
 }
 
