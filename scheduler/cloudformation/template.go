@@ -200,6 +200,11 @@ func (t *EmpireTemplate) Execute(w io.Writer, data interface{}) error {
 		return err
 	}
 
+	raw, err := json.MarshalIndent(v, "", "  ")
+	if err == nil {
+		fmt.Println(string(raw))
+	}
+
 	return json.NewEncoder(w).Encode(v)
 }
 
